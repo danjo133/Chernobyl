@@ -30,6 +30,15 @@ ENV CLAUDE_CONFIG_DIR=/home/node/.claude \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     PIP_CERT=/etc/ssl/certs/ca-certificates.crt
 
+# Pre-create the volume mountpoints owned by node. Docker copies a path's ownership
+# into a FRESH named volume on first mount, so node owns its config + build dirs
+# without an init step or CAP_CHOWN. (Caveat: only applies to brand-new volumes — an
+# already-root-owned volume from a prior run must be removed or chowned once.)
+RUN mkdir -p /home/node/.claude \
+             /workspace/node_modules /workspace/.venv /workspace/target /workspace/dist \
+ && chown -R node:node /home/node/.claude /workspace \
+ && chmod 700 /home/node/.claude
+
 # TODO: to keep the IDE backend off the egress allowlist, pre-bake it here
 #       (vscode-server / JetBrains backend). See docs/SANDBOX-PLAN.md §13.
 
