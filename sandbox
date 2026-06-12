@@ -1,31 +1,61 @@
 #!/usr/bin/env bash
-# sandbox — manage Claude Code sandboxes (UNVERIFIED scaffold). See docs/SANDBOX-PLAN.md.
+# sandbox — manage Claude Code sandboxes. See docs/SANDBOX-PLAN.md.
 #
 #   sandbox up   --source PATH [--name NAME] [--worktree BRANCH] [--port HOST:CTR]
+#                [--allow-url DOMAIN]...   add domain(s) to the egress allowlist
+#                [--allow-ip IP]...        add IP(s) to the egress allowlist
+#                [--allow-internet]        UNRESTRICTED egress (no allowlist, no MITM)
 #   sandbox ls
 #   sandbox down [--name NAME]
 #   sandbox open [--name NAME]          # exec an interactive Claude Code session
 #
 # Each sandbox is a compose project (COMPOSE_PROJECT_NAME) -> isolated networks/volumes.
 # Parallel sandboxes = different --name (and ideally different --worktree of a repo).
+# Auth/agents come from a shared host-side Claude home (SANDBOX_CLAUDE_HOME); log in once.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DC="$HERE/.devcontainer"
 COMPOSE=(docker compose -f "$DC/compose.yaml")
 
+# Shared, per-user (NOT per-sandbox) Claude home: auth + settings + agents/skills +
+# session logs, bind-mounted into every sandbox. Login once; every sandbox inherits it.
+SANDBOX_CLAUDE_HOME="${SANDBOX_CLAUDE_HOME:-$HOME/.sandbox/claude-home}"
+# Minions toolkit repo on the host (bound read-only into each sandbox).
+MINIONS_DIR="${MINIONS_DIR:-$HOME/dev/Minions}"
+
 die() { echo "sandbox: $*" >&2; exit 1; }
+
+# Populate the shared Claude home (idempotent). Symlinks target the CONTAINER path
+# (/home/node/dev/Minions) — dangling on the host, valid inside every sandbox.
+setup_claude_home() {
+  mkdir -p "$SANDBOX_CLAUDE_HOME" "$SANDBOX_CLAUDE_HOME/minions-logs"
+  if [ -d "$MINIONS_DIR" ]; then
+    ln -sfn /home/node/dev/Minions/agents "$SANDBOX_CLAUDE_HOME/agents"
+    ln -sfn /home/node/dev/Minions/skills "$SANDBOX_CLAUDE_HOME/skills"
+    # Generate settings.json once (hooks + agent-teams env), $HOME -> container home.
+    # Left alone on re-runs so user edits survive; delete it to regenerate from template.
+    if [ ! -f "$SANDBOX_CLAUDE_HOME/settings.json" ] && [ -f "$MINIONS_DIR/settings.template.json" ]; then
+      sed 's|\$HOME|/home/node|g' "$MINIONS_DIR/settings.template.json" > "$SANDBOX_CLAUDE_HOME/settings.json"
+    fi
+  else
+    echo "sandbox: WARNING — MINIONS_DIR ($MINIONS_DIR) not found; agents/skills/hooks won't load." >&2
+  fi
+}
 
 cmd="${1:-help}"; shift || true
 
 case "$cmd" in
   up)
-    SOURCE=""; NAME=""; WORKTREE=""; PORT=""
+    SOURCE=""; NAME=""; WORKTREE=""; PORT=""; ALLOW_INTERNET=0; ALLOW_EXTRA=""
     while [ $# -gt 0 ]; do case "$1" in
       --source) SOURCE="$2"; shift 2;;
       --name) NAME="$2"; shift 2;;
       --worktree) WORKTREE="$2"; shift 2;;
       --port) PORT="$2"; shift 2;;
+      --allow-internet) ALLOW_INTERNET=1; shift;;
+      --allow-url) ALLOW_EXTRA="$ALLOW_EXTRA $2"; shift 2;;
+      --allow-ip)  ALLOW_EXTRA="$ALLOW_EXTRA $2"; shift 2;;
       *) die "unknown arg $1";;
     esac; done
     [ -n "$SOURCE" ] || die "--source is required"
@@ -46,6 +76,21 @@ case "$cmd" in
     NAME="${NAME:-cc-$(basename "$SOURCE" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '-' | sed 's/-*$//')}"
     MOUNT="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/devfilter/$NAME"
 
+    setup_claude_home
+
+    # Per-sandbox egress allowlist: base file + any --allow-url/--allow-ip entries.
+    # (Ignored when --allow-internet, which bypasses the proxy entirely.)
+    ALLOWLIST_FILE="$DC/gateway/allowed-domains.txt"
+    if [ -n "$ALLOW_EXTRA" ]; then
+      ALLOWLIST_FILE="$DC/.allowlist-$NAME.txt"
+      {
+        cat "$DC/gateway/allowed-domains.txt"
+        echo ""
+        echo "# --- per-sandbox additions ($NAME) ---"
+        for h in $ALLOW_EXTRA; do echo "$h"; done
+      } > "$ALLOWLIST_FILE"
+    fi
+
     # Write the env compose + mount.sh consume.
     cat > "$DC/.env" <<EOF
 SANDBOX_NAME=$NAME
@@ -53,9 +98,14 @@ SANDBOX_SOURCE=$SOURCE
 SANDBOX_MOUNT=$MOUNT
 CLAUDE_CODE_VERSION=${CLAUDE_CODE_VERSION:-latest}
 BROKER_CONTROL_DIR=$DC/.broker-control-$NAME
+SANDBOX_CLAUDE_HOME=$SANDBOX_CLAUDE_HOME
+MINIONS_DIR=$MINIONS_DIR
+ALLOW_INTERNET=$ALLOW_INTERNET
+ALLOWLIST_FILE=$ALLOWLIST_FILE
 EOF
     [ -n "$PORT" ] && echo "FORWARD_SPEC=127.0.0.1:$PORT" >> "$DC/.env"
     mkdir -p "$DC/.broker-control-$NAME"
+    [ "$ALLOW_INTERNET" = "1" ] && echo "sandbox: WARNING — --allow-internet: egress is UNRESTRICTED (no allowlist, no MITM)." >&2
 
     "$DC/fusefilter/mount.sh"
     COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" --env-file "$DC/.env" up -d --build
@@ -91,6 +141,6 @@ EOF
     ;;
 
   *)
-    sed -n '2,12p' "$0"
+    sed -n '2,15p' "$0"
     ;;
 esac

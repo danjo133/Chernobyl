@@ -29,6 +29,9 @@ ENV CLAUDE_CONFIG_DIR=/home/node/.claude \
     REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     PIP_CERT=/etc/ssl/certs/ca-certificates.crt
+# Put Minions CLI tools (minions-scan/minions-query) on PATH. Separate ENV so the
+# base image's existing $PATH is expanded and preserved, not clobbered.
+ENV PATH=/home/node/dev/Minions/tools/bin:${PATH}
 
 # Pre-create the volume mountpoints owned by node. Docker copies a path's ownership
 # into a FRESH named volume on first mount, so node owns its config + build dirs

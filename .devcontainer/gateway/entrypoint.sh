@@ -43,42 +43,54 @@ ip6tables -F 2>/dev/null || true
 ip6tables -P OUTPUT DROP 2>/dev/null || true
 ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
 
-# ---------------------------------------------------------------------------
-# IPv4 NAT: transparently redirect the workload's HTTP(S) to mitmproxy.
-# The proxy's OWN traffic (uid=proxy) is exempted so it can reach upstreams.
-# ---------------------------------------------------------------------------
+# Always restore Docker's embedded-DNS hook first (both modes need working DNS).
 # Flush ONLY our own OUTPUT chain — never the whole nat table. `iptables -t nat -F`
 # wipes Docker's embedded-DNS hook (the OUTPUT -> DOCKER_OUTPUT jump that DNATs the
 # 127.0.0.11 resolver), which silently breaks name resolution for the workload.
 iptables -t nat -F OUTPUT
-# Restore Docker's embedded-DNS resolver jump if present (it lives in OUTPUT and the
-# flush above drops it). Must come first so DNS to 127.0.0.11 is DNAT'd, not redirected.
 if iptables -t nat -L DOCKER_OUTPUT -n >/dev/null 2>&1; then
   iptables -t nat -A OUTPUT -d 127.0.0.11/32 -j DOCKER_OUTPUT
 fi
-iptables -t nat -A OUTPUT -m owner --uid-owner "$PROXY_UID" -j RETURN
-iptables -t nat -A OUTPUT -o lo -j RETURN
-iptables -t nat -A OUTPUT -p tcp --dport 80  -j REDIRECT --to-ports "$MITM_PORT"
-iptables -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-ports "$MITM_PORT"
 
-# ---------------------------------------------------------------------------
-# IPv4 filter: workload may only reach loopback, DNS, and the (local) proxy.
-# The proxy itself is unrestricted at L3 — it enforces the domain allowlist in
-# broker_addon.py. Everything else from the workload is dropped.
-# ---------------------------------------------------------------------------
-iptables -F OUTPUT
-iptables -P OUTPUT DROP
-iptables -A OUTPUT -o lo -j ACCEPT
-# REDIRECT'd packets (dst rewritten to 127.0.0.1:MITM) do NOT match `-o lo` here:
-# the reroute to lo happens only AFTER the whole LOCAL_OUT hook chain, so filter
-# OUTPUT still sees the original eth0 route. Match by rewritten destination instead.
-iptables -A OUTPUT -p tcp -d 127.0.0.1 --dport "$MITM_PORT" -j ACCEPT
-iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-iptables -A OUTPUT -m owner --uid-owner "$PROXY_UID" -j ACCEPT
-iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
-iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
-# (REDIRECT'd 80/443 packets now have a local destination -> matched by lo/ESTABLISHED.)
-# TODO: optionally run dnsmasq here restricted to the allowlist for DNS-level defense in depth.
+ALLOW_INTERNET="${ALLOW_INTERNET:-0}"
+if [ "$ALLOW_INTERNET" = "1" ]; then
+  # ---------------------------------------------------------------------------
+  # UNRESTRICTED egress: no REDIRECT to mitmproxy, no allowlist, no MITM. The
+  # workload talks straight to the internet over real TLS. Opt-in escape hatch
+  # (sandbox --allow-internet) — drops the egress-containment guarantee.
+  # ---------------------------------------------------------------------------
+  echo "gateway: ALLOW_INTERNET=1 — UNRESTRICTED egress (no allowlist, no MITM)."
+  iptables -F OUTPUT
+  iptables -P OUTPUT ACCEPT
+else
+  # ---------------------------------------------------------------------------
+  # IPv4 NAT: transparently redirect the workload's HTTP(S) to mitmproxy.
+  # The proxy's OWN traffic (uid=proxy) is exempted so it can reach upstreams.
+  # ---------------------------------------------------------------------------
+  iptables -t nat -A OUTPUT -m owner --uid-owner "$PROXY_UID" -j RETURN
+  iptables -t nat -A OUTPUT -o lo -j RETURN
+  iptables -t nat -A OUTPUT -p tcp --dport 80  -j REDIRECT --to-ports "$MITM_PORT"
+  iptables -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-ports "$MITM_PORT"
+
+  # ---------------------------------------------------------------------------
+  # IPv4 filter: workload may only reach loopback, DNS, and the (local) proxy.
+  # The proxy itself is unrestricted at L3 — it enforces the domain allowlist in
+  # broker_addon.py. Everything else from the workload is dropped.
+  # ---------------------------------------------------------------------------
+  iptables -F OUTPUT
+  iptables -P OUTPUT DROP
+  iptables -A OUTPUT -o lo -j ACCEPT
+  # REDIRECT'd packets (dst rewritten to 127.0.0.1:MITM) do NOT match `-o lo` here:
+  # the reroute to lo happens only AFTER the whole LOCAL_OUT hook chain, so filter
+  # OUTPUT still sees the original eth0 route. Match by rewritten destination instead.
+  iptables -A OUTPUT -p tcp -d 127.0.0.1 --dport "$MITM_PORT" -j ACCEPT
+  iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+  iptables -A OUTPUT -m owner --uid-owner "$PROXY_UID" -j ACCEPT
+  iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+  iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
+  # (REDIRECT'd 80/443 packets now have a local destination -> matched by lo/ESTABLISHED.)
+  # TODO: optionally run dnsmasq here restricted to the allowlist for DNS-level defense in depth.
+fi
 
 # ---------------------------------------------------------------------------
 # Broker store: redis on a unix socket only (no TCP). Lives in the gateway's

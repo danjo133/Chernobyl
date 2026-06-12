@@ -1,0 +1,5 @@
+# Generated per-sandbox artifacts (written by the `sandbox` CLI / mount.sh)
+.env
+.allowlist-*.txt
+.broker-control-*/
+fusefilter/gitignore-fuse
