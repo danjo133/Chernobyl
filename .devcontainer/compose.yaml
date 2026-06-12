@@ -1,0 +1,85 @@
+# Claude Code sandbox — compose topology.  See docs/SANDBOX-PLAN.md.
+# UNVERIFIED scaffold: needs a `docker compose build && up` pass once Bash works.
+#
+# Two services:
+#   gateway      — firewall + credential broker. Owns the network namespace.
+#   devcontainer — the workload. Shares the gateway's netns (network_mode: service:gateway),
+#                  so it CANNOT alter egress rules (it holds no NET_ADMIN/NET_RAW).
+#
+# Per-sandbox isolation comes from the compose *project name* (set by the `sandbox` CLI
+# via COMPOSE_PROJECT_NAME): networks and named volumes are project-scoped.
+
+name: ${SANDBOX_NAME:-cc-sandbox}
+
+services:
+  gateway:
+    build:
+      context: ./gateway
+    cap_add: [NET_ADMIN, NET_RAW]
+    security_opt: ["no-new-privileges:true"]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.all.send_redirects: "0"
+    networks: [egress]
+    volumes:
+      - gateway-ca:/home/proxy/.mitmproxy           # mitmproxy confdir incl. CA PRIVATE KEY — gateway only
+      - ca-pub:/ca-pub                              # PUBLIC cert only, populated by entrypoint, shared ro to workload
+      - broker-data:/var/lib/broker                 # redis persistence (proxy-only, unix socket)
+      - ./gateway/allowed-domains.txt:/etc/broker/allowed-domains.txt:ro
+      - ./gateway/scopes.yaml:/etc/broker/scopes.yaml:ro
+      - ./gateway/broker_addon.py:/opt/broker/broker_addon.py:ro
+      # Host-side credential filler talks to the broker over this control socket dir.
+      # NOT mounted into the workload (different mount namespace) — see broker/README.md.
+      - ${BROKER_CONTROL_DIR:-./.broker-control}:/run/broker-control
+    ports:
+      # Published ports MUST be declared HERE — the gateway owns the netns the workload shares.
+      # The `sandbox` CLI appends app ports. Default example: a dev server on :3000, host-local only.
+      - "${FORWARD_SPEC:-127.0.0.1:3000:3000}"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "test -f /ca-pub/mitmproxy-ca-cert.pem && nc -z 127.0.0.1 8080"]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+    restart: unless-stopped
+
+  devcontainer:
+    build:
+      context: .
+      dockerfile: devcontainer.Dockerfile
+      args:
+        CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-latest}
+    network_mode: "service:gateway"     # share gateway netns; no own network stack
+    depends_on:
+      gateway:
+        condition: service_healthy
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    user: node
+    working_dir: /workspace
+    volumes:
+      # Host FUSE-filtered view of the repo/worktree (mounted by fusefilter/mount.sh).
+      - ${SANDBOX_MOUNT:?set SANDBOX_MOUNT to the host FUSE-filtered path (sandbox CLI / mount.sh sets this)}:/workspace
+      - ca-pub:/ca:ro                    # public CA cert only
+      - claude-config:/home/node/.claude # auth/session persistence across rebuilds
+      # Build/dep dirs backed by per-sandbox volumes (see build-dirs.txt) — keeps host artifacts
+      # out, survives rebuilds, isolates parallel sandboxes. Extend via the sandbox CLI.
+      - build-node_modules:/workspace/node_modules
+      - build-venv:/workspace/.venv
+      - build-target:/workspace/target
+      - build-dist:/workspace/dist
+    command: sleep infinity
+
+networks:
+  egress:
+    driver: bridge
+
+volumes:
+  gateway-ca:
+  ca-pub:
+  broker-data:
+  claude-config:
+  build-node_modules:
+  build-venv:
+  build-target:
+  build-dist:

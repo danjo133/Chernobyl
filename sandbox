@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# sandbox — manage Claude Code sandboxes (UNVERIFIED scaffold). See docs/SANDBOX-PLAN.md.
+#
+#   sandbox up   --source PATH [--name NAME] [--worktree BRANCH] [--port HOST:CTR]
+#   sandbox ls
+#   sandbox down [--name NAME]
+#   sandbox open [--name NAME]          # exec an interactive Claude Code session
+#
+# Each sandbox is a compose project (COMPOSE_PROJECT_NAME) -> isolated networks/volumes.
+# Parallel sandboxes = different --name (and ideally different --worktree of a repo).
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DC="$HERE/.devcontainer"
+COMPOSE=(docker compose -f "$DC/compose.yaml")
+
+die() { echo "sandbox: $*" >&2; exit 1; }
+
+cmd="${1:-help}"; shift || true
+
+case "$cmd" in
+  up)
+    SOURCE=""; NAME=""; WORKTREE=""; PORT=""
+    while [ $# -gt 0 ]; do case "$1" in
+      --source) SOURCE="$2"; shift 2;;
+      --name) NAME="$2"; shift 2;;
+      --worktree) WORKTREE="$2"; shift 2;;
+      --port) PORT="$2"; shift 2;;
+      *) die "unknown arg $1";;
+    esac; done
+    [ -n "$SOURCE" ] || die "--source is required"
+    SOURCE="$(cd "$SOURCE" && pwd)"
+
+    # Same repo, multiple tasks -> isolate via git worktree.
+    if [ -n "$WORKTREE" ]; then
+      WT_DIR="$SOURCE/../$(basename "$SOURCE")-$WORKTREE"
+      if [ ! -d "$WT_DIR" ]; then
+        echo "sandbox: creating worktree $WT_DIR ($WORKTREE)"
+        git -C "$SOURCE" worktree add "$WT_DIR" "$WORKTREE"
+      fi
+      SOURCE="$(cd "$WT_DIR" && pwd)"
+    fi
+
+    # Compose project names must be [a-z0-9][a-z0-9_-]*: lowercase, strip trailing '-'
+    # (tr -c also mangles the trailing newline into one).
+    NAME="${NAME:-cc-$(basename "$SOURCE" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '-' | sed 's/-*$//')}"
+    MOUNT="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/devfilter/$NAME"
+
+    # Write the env compose + mount.sh consume.
+    cat > "$DC/.env" <<EOF
+SANDBOX_NAME=$NAME
+SANDBOX_SOURCE=$SOURCE
+SANDBOX_MOUNT=$MOUNT
+CLAUDE_CODE_VERSION=${CLAUDE_CODE_VERSION:-latest}
+BROKER_CONTROL_DIR=$DC/.broker-control-$NAME
+EOF
+    [ -n "$PORT" ] && echo "FORWARD_SPEC=127.0.0.1:$PORT" >> "$DC/.env"
+    mkdir -p "$DC/.broker-control-$NAME"
+
+    "$DC/fusefilter/mount.sh"
+    COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" --env-file "$DC/.env" up -d --build
+    # postCreateCommand only runs under VS Code — on this headless path the CA
+    # trust must be installed explicitly or all TLS in the workload fails.
+    COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" --env-file "$DC/.env" \
+      exec devcontainer /usr/local/bin/trust-ca.sh
+    echo "sandbox: '$NAME' up. Open with:  ./sandbox open --name $NAME"
+    ;;
+
+  ls)
+    docker compose ls
+    ;;
+
+  down)
+    NAME=""
+    while [ $# -gt 0 ]; do case "$1" in --name) NAME="$2"; shift 2;; *) die "unknown arg $1";; esac; done
+    [ -n "$NAME" ] || { [ -f "$DC/.env" ] && . "$DC/.env" && NAME="$SANDBOX_NAME"; }
+    [ -n "$NAME" ] || die "--name required (or run from a configured sandbox)"
+    COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" down
+    "$DC/fusefilter/unmount.sh" "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/devfilter/$NAME" || true
+    ;;
+
+  open)
+    NAME=""
+    while [ $# -gt 0 ]; do case "$1" in --name) NAME="$2"; shift 2;; *) die "unknown arg $1";; esac; done
+    [ -n "$NAME" ] || { [ -f "$DC/.env" ] && . "$DC/.env" && NAME="$SANDBOX_NAME"; }
+    [ -n "$NAME" ] || die "--name required"
+    COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" exec devcontainer \
+      bash -lc 'claude --dangerously-skip-permissions'
+    ;;
+
+  *)
+    sed -n '2,12p' "$0"
+    ;;
+esac

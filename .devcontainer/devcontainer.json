@@ -1,0 +1,34 @@
+{
+  "name": "claude-sandbox",
+  "dockerComposeFile": "compose.yaml",
+  "service": "devcontainer",
+  "workspaceFolder": "/workspace",
+
+  // Host-side: mount the gitignore-filtered FUSE view before the container starts,
+  // and write the resulting SANDBOX_MOUNT into .devcontainer/.env so compose picks it up.
+  // (VS Code runs this in the local workspace root. JetBrains support is spotty — see
+  //  docs/SANDBOX-PLAN.md §13; for JetBrains, run `./sandbox up` and ATTACH instead.)
+  "initializeCommand": "./.devcontainer/fusefilter/mount.sh",
+
+  // In-container: trust the gateway's MITM CA and point the toolchain at it.
+  "postCreateCommand": "/usr/local/bin/trust-ca.sh",
+
+  "remoteUser": "node",
+
+  "containerEnv": {
+    "CLAUDE_CONFIG_DIR": "/home/node/.claude",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "DISABLE_AUTOUPDATER": "1"
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": ["anthropic.claude-code"]
+    }
+  }
+
+  // NOTE: do NOT add "forwardPorts" that publish to the host here — with
+  // network_mode: service:gateway the workload has no own ports. VS Code's auto
+  // port-forwarding (over docker exec) still works. For CLI, publish on the gateway
+  // service in compose.yaml (FORWARD_SPEC).
+}

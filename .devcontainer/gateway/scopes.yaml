@@ -1,0 +1,22 @@
+# Reference schema for credential scopes (documentation + optional seed for the filler).
+# The live source of truth is redis, populated out-of-band by the host-side filler
+# (broker/README.md). This file documents the shape and can seed static host injections.
+# See docs/SANDBOX-PLAN.md §4.
+
+# Inject-by-host: attach these headers to every (allowed) request to the host.
+# Useful for simple static tokens. redis key: broker:host:<host>
+host_injection:
+  # api.github.com:
+  #   Authorization: "token ghp_REAL_TOKEN_NEVER_IN_CONTAINER"
+
+# Phantom handles: the workload presents `X-Sandbox-Handle: <handle>`; the gateway
+# swaps in the real headers only if host + path_prefix + method match. redis key:
+# broker:handle:<handle>  (set with a TTL = expiry)
+handles:
+  # example-kube:
+  #   host: kube-apiserver.example.internal
+  #   path_prefix: /
+  #   methods: [GET, LIST, WATCH]          # least-privilege; omit for any method
+  #   ttl_seconds: 3600
+  #   headers:
+  #     Authorization: "Bearer REAL_SHORT_LIVED_TOKEN"

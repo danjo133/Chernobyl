@@ -1,0 +1,17 @@
+# Build/dependency directories backed by per-sandbox named volumes (NOT bound from host).
+# Keeps platform-specific artifacts out of the container, survives rebuilds, and isolates
+# parallel sandboxes. See docs/SANDBOX-PLAN.md §12.
+#
+# compose.yaml hardcodes the common ones below; the `sandbox` CLI can template extras
+# per project from this file. One path per line, relative to /workspace.
+
+node_modules
+.venv
+target
+dist
+.next
+build
+.gradle
+__pycache__
+.pytest_cache
+.mypy_cache

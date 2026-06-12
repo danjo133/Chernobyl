@@ -1,0 +1,39 @@
+# Egress allowlist. One host pattern per line. Hot-reloaded by broker_addon.py on change.
+#   foo.com        -> allowed AND decrypted (so credentials can be injected)
+#   !foo.com       -> allowed but SPLICED (not decrypted) — use for cert-pinned hosts
+#   *.foo.com      -> glob; bare "foo.com" also matches subdomains (host.endswith)
+# Anything not listed is DENIED. Telemetry domains are intentionally omitted
+# (disabled via CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1). See docs/SANDBOX-PLAN.md §6.
+
+# --- Claude Code core ---
+api.anthropic.com
+console.anthropic.com
+claude.ai
+platform.claude.com
+downloads.claude.ai
+raw.githubusercontent.com
+
+# --- git / GitHub ---
+github.com
+api.github.com
+codeload.github.com
+objects.githubusercontent.com
+githubusercontent.com
+
+# --- npm ---
+registry.npmjs.org
+# npm CDN is fronted by a pinned CDN; splice it rather than decrypt:
+!registry.npmjs.cf
+
+# --- python ---
+pypi.org
+files.pythonhosted.org
+
+# --- add per-toolchain as needed (check the mitmproxy DENY log to see what's blocked) ---
+# crates.io
+# static.crates.io
+# proxy.golang.org
+# sum.golang.org
+
+# --- kube apiserver host (broker injects the token for this host) ---
+# kube-apiserver.example.internal
