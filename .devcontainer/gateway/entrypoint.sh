@@ -7,10 +7,18 @@
 # NET_ADMIN to set rules); mitmproxy/redis drop to the unprivileged `proxy` uid.
 set -eu
 
-PROXY_USER=proxy
+PROXY_USER=mitm
 PROXY_UID=$(id -u "$PROXY_USER")
 MITM_PORT=8080
-CONFDIR=/home/proxy/.mitmproxy
+CONFDIR=/home/mitm/.mitmproxy
+
+# Tripwire: the proxy uid must not collide with the workload's uid (default node=1000).
+# A collision makes the workload match the proxy's iptables RETURN exemption and bypass
+# the firewall (see Dockerfile). Refuse to start rather than run wide open.
+if [ "$PROXY_UID" = "1000" ]; then
+  echo "gateway: FATAL — proxy uid 1000 collides with the workload; egress filter would be bypassed." >&2
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # sysctls (compose sets these too; harmless to reassert)
@@ -18,6 +26,15 @@ CONFDIR=/home/proxy/.mitmproxy
 sysctl -w net.ipv4.ip_forward=1            >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.all.rp_filter=0    >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.all.send_redirects=0 >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# The CA confdir is a named volume (gateway-ca) mounted root-owned over mitm's
+# home; mitmproxy runs as `mitm` and must be able to create the CA there.
+# ---------------------------------------------------------------------------
+mkdir -p "$CONFDIR"
+# Recursive: the volume persists across rebuilds, so pre-existing CA files may be
+# owned by a previous proxy uid and must be reclaimed by the current one.
+chown -R "$PROXY_USER:$PROXY_USER" "$CONFDIR"
 
 # ---------------------------------------------------------------------------
 # IPv6: no egress at all (prevents bypassing the IPv4 filter over v6)
@@ -30,7 +47,15 @@ ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
 # IPv4 NAT: transparently redirect the workload's HTTP(S) to mitmproxy.
 # The proxy's OWN traffic (uid=proxy) is exempted so it can reach upstreams.
 # ---------------------------------------------------------------------------
-iptables -t nat -F
+# Flush ONLY our own OUTPUT chain — never the whole nat table. `iptables -t nat -F`
+# wipes Docker's embedded-DNS hook (the OUTPUT -> DOCKER_OUTPUT jump that DNATs the
+# 127.0.0.11 resolver), which silently breaks name resolution for the workload.
+iptables -t nat -F OUTPUT
+# Restore Docker's embedded-DNS resolver jump if present (it lives in OUTPUT and the
+# flush above drops it). Must come first so DNS to 127.0.0.11 is DNAT'd, not redirected.
+if iptables -t nat -L DOCKER_OUTPUT -n >/dev/null 2>&1; then
+  iptables -t nat -A OUTPUT -d 127.0.0.11/32 -j DOCKER_OUTPUT
+fi
 iptables -t nat -A OUTPUT -m owner --uid-owner "$PROXY_UID" -j RETURN
 iptables -t nat -A OUTPUT -o lo -j RETURN
 iptables -t nat -A OUTPUT -p tcp --dport 80  -j REDIRECT --to-ports "$MITM_PORT"
@@ -44,6 +69,10 @@ iptables -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-ports "$MITM_PORT"
 iptables -F OUTPUT
 iptables -P OUTPUT DROP
 iptables -A OUTPUT -o lo -j ACCEPT
+# REDIRECT'd packets (dst rewritten to 127.0.0.1:MITM) do NOT match `-o lo` here:
+# the reroute to lo happens only AFTER the whole LOCAL_OUT hook chain, so filter
+# OUTPUT still sees the original eth0 route. Match by rewritten destination instead.
+iptables -A OUTPUT -p tcp -d 127.0.0.1 --dport "$MITM_PORT" -j ACCEPT
 iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 iptables -A OUTPUT -m owner --uid-owner "$PROXY_UID" -j ACCEPT
 iptables -A OUTPUT -p udp --dport 53 -j ACCEPT

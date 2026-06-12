@@ -1,0 +1,21 @@
+```
+                    ┌────────────────────────────────────────────────────┐
+   HOST             │  gateway container — the firewall + credential     │
+ ┌──────────┐       │  broker (the only path to the internet)            │
+ │ ~/dev/   │       │  • NET_ADMIN/NET_RAW  • mitmproxy (transparent)    │──┐ egress
+ │  myrepo  │       │  • iptables REDIRECT 80/443 → mitmproxy            │  │ network
+ └────┬─────┘       │  • allowlist + scope-checked credential injection  │  │ (internet)
+      │ FUSE        │  • redis/vault: handle→real cred, scope, TTL       │──┘
+      │ (gitignore  │  • flow log (redacted for auth)                    │
+      │  filter,    └───────────────────────▲────────────────────────────┘
+      │  host-side) shared net namespace    │
+ ┌────▼─────────┐    ┌──────────────────────┴────────────────────────────┐
+ │/run/.../view │──► │  devcontainer — the workload                      │
+ │ filtered repo│bind│  network_mode: service:gateway                    │
+ └──────────────┘    │  • NO net caps — cannot read/alter egress rules   │
+                     │  • Claude Code + toolchain                        │
+   HOST-side filler  │  • has opaque handles / nothing — never real creds│
+   tool / MCP ─────► │  • trusts mitmproxy CA                            │
+   (runs real OAuth) └───────────────────────────────────────────────────┘
+```
+

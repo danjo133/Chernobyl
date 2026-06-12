@@ -62,7 +62,9 @@ EOF
     # postCreateCommand only runs under VS Code — on this headless path the CA
     # trust must be installed explicitly or all TLS in the workload fails.
     COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" --env-file "$DC/.env" \
-      exec devcontainer /usr/local/bin/trust-ca.sh
+      exec -u root devcontainer /usr/local/bin/trust-ca.sh   # system store
+    COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" --env-file "$DC/.env" \
+      exec devcontainer /usr/local/bin/trust-ca.sh           # node home (NODE_EXTRA_CA_CERTS)
     echo "sandbox: '$NAME' up. Open with:  ./sandbox open --name $NAME"
     ;;
 

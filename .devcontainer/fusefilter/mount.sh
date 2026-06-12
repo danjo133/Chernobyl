@@ -19,10 +19,11 @@ SANDBOX_MOUNT="${SANDBOX_MOUNT:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/devfilter
 BIN="$HERE/gitignore-fuse"
 if [ ! -x "$BIN" ]; then
   echo "mount.sh: building gitignore-fuse..."
+  # CGO_ENABLED=0: go-fuse is pure Go; keep the binary static (and buildable without gcc).
   if command -v go >/dev/null; then
-    ( cd "$HERE" && go build -o "$BIN" . )
+    ( cd "$HERE" && CGO_ENABLED=0 go build -o "$BIN" . )
   elif command -v nix >/dev/null; then
-    ( cd "$HERE" && nix shell nixpkgs#go --command go build -o "$BIN" . )
+    ( cd "$HERE" && nix shell nixpkgs#go --command env CGO_ENABLED=0 go build -o "$BIN" . )
   else
     echo "mount.sh: need go (or nix) to build gitignore-fuse" >&2; exit 1
   fi

@@ -23,7 +23,7 @@ services:
       net.ipv4.conf.all.send_redirects: "0"
     networks: [egress]
     volumes:
-      - gateway-ca:/home/proxy/.mitmproxy           # mitmproxy confdir incl. CA PRIVATE KEY — gateway only
+      - gateway-ca:/home/mitm/.mitmproxy            # mitmproxy confdir incl. CA PRIVATE KEY — gateway only
       - ca-pub:/ca-pub                              # PUBLIC cert only, populated by entrypoint, shared ro to workload
       - broker-data:/var/lib/broker                 # redis persistence (proxy-only, unix socket)
       - ./gateway/allowed-domains.txt:/etc/broker/allowed-domains.txt:ro
