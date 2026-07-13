@@ -1,0 +1,24 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# --- Per-sandbox runtime state written by the `sandbox` CLI (NEVER commit) ---
+# Broker control dirs: webui password, unix socket, pid, request logs.
+.devcontainer/.broker-control-*/
+# Tools sidecar SSH material: private key + authorized_keys.
+.devcontainer/.tools-*/
+# Generated per-sandbox egress allowlist and compose env.
+.devcontainer/.allowlist-*.txt
+.devcontainer/.env
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+.npmrc
+
+# Build/dependency dirs (backed by per-sandbox volumes inside the container)
+/node_modules/
+/.venv/
+/dist/
+/target/
