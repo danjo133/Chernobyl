@@ -1,0 +1,51 @@
+# Keep the build context small and avoid baking secrets / large output into
+# the image. The build context here is tooling/docker/, but compose mounts the
+# repo at runtime, so nothing below needs to be in the image.
+
+# VCS
+.git
+.gitignore
+
+# Program discovery DB (rebuilt locally, may be large)
+programs/programs.db
+**/*.db
+
+# Recon output and per-target artifacts (huge, regenerated)
+recon/targets/
+recon/**/output/
+
+# Findings & PoC artifacts (may contain sensitive evidence)
+findings/**/F-*/
+findings/**/*.poc
+findings/**/*.har
+findings/**/*.png
+findings/**/*.jpg
+
+# Wordlists (mounted volume, never in image)
+opt/wordlists/
+**/wordlists/
+
+# Captured proxy flows
+**/*.mitm
+**/*.flows
+
+# Python / build cruft
+__pycache__/
+**/__pycache__/
+*.pyc
+.venv/
+**/.venv/
+dist/
+target/
+node_modules/
+
+# Local env / secrets
+.env
+*.env
+**/*.key
+**/*.pem
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

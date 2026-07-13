@@ -1,0 +1,56 @@
+# LiteLLM gateway — model routing for all your coding clients.
+# Clients send a `model_name` from the left column; LiteLLM maps it to the backend
+# on the right. Add/rename freely — the alias is the contract your clients use.
+#
+# IMPORTANT: your Claude Max subscription is NOT usable here. Anything routed to
+# Anthropic through LiteLLM bills against ANTHROPIC_API_KEY (API rates). Keep
+# Claude Code on `/login` + direct egress for subscription use; route through
+# here only when you want a non-subscription / programmatic / cheaper path.
+
+model_list:
+  # --- Anthropic via API key (API-billed, NOT the Max subscription) ----------
+  - model_name: claude-opus            # request this alias to hit real Claude (API key)
+    litellm_params:
+      model: anthropic/claude-opus-4-8
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: claude-sonnet
+    litellm_params:
+      model: anthropic/claude-sonnet-4-6
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  # --- OpenRouter (one key, hundreds of models) ------------------------------
+  # Browse ids at https://openrouter.ai/models and add aliases as you like.
+  - model_name: or-glm
+    litellm_params:
+      model: openrouter/z-ai/glm-4.6
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: or-qwen-coder
+    litellm_params:
+      model: openrouter/qwen/qwen3-coder
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # --- Local on the 5090: vLLM (OpenAI-compatible, port 8000) -----------------
+  # `host.docker.internal` resolves to the host via extra_hosts in compose.yaml.
+  # The served-model name must match what `vllm serve` exposes (see README).
+  - model_name: local-coder            # <- your day-to-day local agentic model
+    litellm_params:
+      model: hosted_vllm/qwen-coder     # the name you pass to `--served-model-name`
+      api_base: http://host.docker.internal:8000/v1
+      api_key: dummy
+
+  # --- Local on the 5090: Ollama (for quick model-shopping, port 11434) -------
+  - model_name: local-ollama
+    litellm_params:
+      model: ollama_chat/qwen2.5-coder:32b
+      api_base: http://host.docker.internal:11434
+
+litellm_settings:
+  # Silently drop provider-unsupported params (e.g. Anthropic `cache_control`,
+  # sampling params a local model rejects) instead of erroring. Prompt caching is
+  # lost on non-Anthropic backends regardless — expected, not a bug.
+  drop_params: true
+
+general_settings:
+  # Clients authenticate to LiteLLM with this (as the API key / bearer token).
+  # It is NOT a provider key — the real provider keys live in the env (above).
+  master_key: os.environ/LITELLM_MASTER_KEY

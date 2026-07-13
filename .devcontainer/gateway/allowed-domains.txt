@@ -29,11 +29,25 @@ registry.npmjs.org
 pypi.org
 files.pythonhosted.org
 
+# --- go (module proxy + checksum db; GOTOOLCHAIN=local avoids toolchain fetches) ---
+proxy.golang.org
+sum.golang.org
+go.dev  # only needed if you re-download the Go toolchain at runtime
+
+# --- docker hub (podman/buildah pulls for image builds) ---
+registry-1.docker.io
+index.docker.io
+auth.docker.io
+production.cloudflare.docker.com
+
 # --- add per-toolchain as needed (check the mitmproxy DENY log to see what's blocked) ---
 # crates.io
 # static.crates.io
-# proxy.golang.org
-# sum.golang.org
+ghcr.io          # GitHub Container Registry
+quay.io
 
 # --- kube apiserver host (broker injects the token for this host) ---
 # kube-apiserver.example.internal
+
+# Other
+semgrep.dev

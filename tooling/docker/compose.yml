@@ -1,0 +1,102 @@
+# Compose stack for the hunting box.
+#
+#   docker compose build
+#   docker compose run --rm hunter
+#   docker compose up -d mitmproxy      # start the proxy in the background
+#
+# Ports:
+#   8080  mitmproxy   HTTP(S) intercept proxy   (point Android/emulator at host:8080)
+#   8081  mitmweb     mitmproxy web UI          (open http://localhost:8081)
+#
+# Volumes:
+#   ../../          -> /workspace      the repo (recon output, findings, etc.)
+#   wordlists       -> /opt/wordlists  SecLists/Assetnote (populate per README; not in image)
+#   mitm-flows      -> /flows          captured HTTP flows shared between services
+
+name: bb-hunter
+
+services:
+  hunter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bb-hunter:latest
+    container_name: bb-hunter
+    working_dir: /workspace
+    # Interactive shell so `docker compose run --rm hunter` drops you into the box.
+    command: /bin/bash
+    tty: true
+    stdin_open: true
+    volumes:
+      # The repo. Relative to this compose file (tooling/docker/ -> repo root).
+      - ../../:/workspace
+      # Wordlists live in a named volume, NOT baked into the image (multi-GB).
+      - wordlists:/opt/wordlists
+      # Share captured flows with the mitmproxy service.
+      - mitm-flows:/flows
+    environment:
+      # API keys read by the tools. Set these in a .env next to this file or
+      # export them in your shell; compose substitutes ${VAR} below.
+      - CHAOS_API_KEY=${CHAOS_API_KEY:-}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - SHODAN_API_KEY=${SHODAN_API_KEY:-}
+    # nmap/naabu raw-socket scans (SYN scan, OS detection) need these caps.
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    networks:
+      - hunt
+
+  mitmproxy:
+    # Official image — run mitmweb (web UI + proxy). No custom build needed.
+    image: mitmproxy/mitmproxy:latest
+    container_name: bb-mitmproxy
+    # mitmweb: --web-host 0.0.0.0 so the UI is reachable from the host.
+    command: >
+      mitmweb
+      --web-host 0.0.0.0
+      --web-port 8081
+      --listen-port 8080
+      --set confdir=/home/mitmproxy/.mitmproxy
+      --save-stream-file /flows/captured.mitm
+    ports:
+      - "8080:8080"   # intercept proxy
+      - "8081:8081"   # web UI
+    volumes:
+      - mitm-flows:/flows
+      # Persist the mitmproxy CA so the cert installed on Android stays valid.
+      - mitm-certs:/home/mitmproxy/.mitmproxy
+    networks:
+      - hunt
+
+  # ---------------------------------------------------------------------------
+  # Caido is intentionally NOT containerized here.
+  #
+  # Caido is the human-in-the-loop AI workstation and is meant to run on the
+  # HOST / desktop (its GUI + Replay/Automate/HTTPQL workflow). It connects to
+  # this framework through its official Claude Skill, not through compose.
+  #   Skill: https://github.com/caido/skills
+  #
+  # If you ever want a headless Caido instance, uncomment and adapt below, but
+  # the supported workflow is desktop Caido + the Claude Skill.
+  #
+  # caido:
+  #   image: caido/caido:latest
+  #   container_name: bb-caido
+  #   ports:
+  #     - "8082:8080"
+  #   volumes:
+  #     - caido-data:/root/.local/share/caido
+  #   networks:
+  #     - hunt
+  # ---------------------------------------------------------------------------
+
+networks:
+  hunt:
+    driver: bridge
+
+volumes:
+  wordlists:
+  mitm-flows:
+  mitm-certs:
+  # caido-data:

@@ -34,6 +34,7 @@ services:
       - ${ALLOWLIST_FILE:-./gateway/allowed-domains.txt}:/etc/broker/allowed-domains.txt:ro
       - ./gateway/scopes.yaml:/etc/broker/scopes.yaml:ro
       - ./gateway/broker_addon.py:/opt/broker/broker_addon.py:ro
+      - ./gateway/control_server.py:/opt/broker/control_server.py:ro
       # Host-side credential filler talks to the broker over this control socket dir.
       # NOT mounted into the workload (different mount namespace) — see broker/README.md.
       - ${BROKER_CONTROL_DIR:-./.broker-control}:/run/broker-control
@@ -59,7 +60,13 @@ services:
       gateway:
         condition: service_healthy
     cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
+    # Hardened default: full seccomp + AppArmor confinement. Rootless image builds need
+    # unshare(CLONE_NEWUSER), which the default seccomp profile blocks for a capless
+    # container — so they are OPT-IN: `./sandbox up --allow-image-build` layers
+    # compose.imagebuild.yaml on top, appending seccomp/apparmor=unconfined. See that
+    # file + .devcontainer/README.md for the trade-off; base stays hardened otherwise.
+    security_opt:
+      - "no-new-privileges:true"
     user: node
     working_dir: /workspace
     volumes:
@@ -79,6 +86,11 @@ services:
       - build-venv:/workspace/.venv
       - build-target:/workspace/target
       - build-dist:/workspace/dist
+      # Go module + build cache (GOPATH/GOCACHE) — fast rebuilds, per-sandbox.
+      - build-go:/home/node/go
+      # Rootless image-build store (vfs graphroot). Can grow large; `down` keeps it,
+      # `docker volume rm` to reclaim. Per-sandbox, so builds don't cross over.
+      - build-containers:/home/node/.local/share/containers
     command: sleep infinity
 
 networks:
@@ -93,3 +105,5 @@ volumes:
   build-venv:
   build-target:
   build-dist:
+  build-go:
+  build-containers:

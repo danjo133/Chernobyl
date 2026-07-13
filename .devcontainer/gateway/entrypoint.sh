@@ -96,6 +96,13 @@ fi
 # Broker store: redis on a unix socket only (no TCP). Lives in the gateway's
 # mount namespace, which the workload does NOT share — so it is unreachable from
 # the workload by construction. proxy-only socket perms as belt-and-braces.
+#
+# Credentials are INTENTIONALLY EPHEMERAL: `--save "" --appendonly no` keeps the
+# store in memory only, so `sandbox down` wipes all secrets — nothing sensitive at
+# rest. Change the egress allowlist with `sandbox allow` (hot-reloaded, no teardown)
+# instead of down/up so creds aren't lost needlessly. To make creds survive down/up,
+# enable AOF here pointing at the broker-data volume — but that writes tokens to disk
+# in plaintext; weigh it against the at-rest exposure first (see SANDBOX-PLAN §8, §15).
 # ---------------------------------------------------------------------------
 runuser -u "$PROXY_USER" -- redis-server \
   --unixsocket /run/broker/redis.sock --unixsocketperm 700 \
@@ -103,14 +110,73 @@ runuser -u "$PROXY_USER" -- redis-server \
   --daemonize no &
 
 # ---------------------------------------------------------------------------
+# Control endpoint + request log live in the bind-mounted control dir so the
+# HOST-side web UI can reach them. The workload does NOT share this mount
+# namespace, so neither the socket nor the log is reachable from the workload.
+# The proxy uid (unprivileged) must be able to create the socket + log file here;
+# the dir is host-private (the CLI's .broker-control-<name>/), so loose perms only
+# affect other LOCAL host users — single-user-host assumption (SANDBOX-PLAN §15).
+# ---------------------------------------------------------------------------
+mkdir -p /run/broker-control
+chmod 0777 /run/broker-control
+runuser -u "$PROXY_USER" -- python3 /opt/broker/control_server.py &
+
+# ---------------------------------------------------------------------------
+# Optional: chain inspected flows to a downstream Caido proxy (the operator's
+# interactive workbench) when CAIDO_UPSTREAM is set — i.e. the tools overlay is
+# active. mitmproxy becomes the TLS *client* to Caido, so it must trust Caido's
+# CA; we fetch it from Caido's /ca.crt endpoint and append it to the default
+# bundle. On success we drop a marker the broker addon reads to enable per-flow
+# `via` routing. Best-effort: if Caido never answers, we log and come up in
+# normal restricted mode (no chaining) rather than wedge the whole sandbox.
+#
+# The fetch MUST run as the proxy uid — it is the only identity the egress filter
+# lets past; root's packets to Caido are dropped by the OUTPUT chain.
+# ---------------------------------------------------------------------------
+MITM_EXTRA=""
+CAIDO_MARKER=/run/broker/caido-upstream
+rm -f "$CAIDO_MARKER"
+if [ -n "${CAIDO_UPSTREAM:-}" ]; then
+  CAIDO_CA="$CONFDIR/caido-upstream-ca.pem"
+  echo "gateway: CAIDO_UPSTREAM=$CAIDO_UPSTREAM — fetching Caido CA..."
+  i=0; ok=0
+  while [ "$i" -lt 60 ]; do
+    if runuser -u "$PROXY_USER" -- curl -fsS --max-time 3 \
+         "http://${CAIDO_UPSTREAM}/ca.crt" -o /tmp/caido-ca.in 2>/dev/null; then
+      ok=1; break
+    fi
+    sleep 1; i=$((i + 1))
+  done
+  if [ "$ok" = "1" ] \
+     && { openssl x509 -in /tmp/caido-ca.in -out /tmp/caido-ca.pem 2>/dev/null \
+          || openssl x509 -inform DER -in /tmp/caido-ca.in -out /tmp/caido-ca.pem 2>/dev/null; }; then
+    # Append the default trust bundle so any non-chained flow still verifies normally
+    # (ssl_verify_upstream_trusted_ca REPLACES the store rather than adding to it).
+    certifi="$(python3 -m certifi 2>/dev/null || true)"
+    cat /tmp/caido-ca.pem ${certifi:+"$certifi"} > "$CAIDO_CA"
+    chown "$PROXY_USER:$PROXY_USER" "$CAIDO_CA"
+    printf '%s' "$CAIDO_UPSTREAM" > "$CAIDO_MARKER"
+    chown "$PROXY_USER:$PROXY_USER" "$CAIDO_MARKER"
+    # lazy: don't open the upstream connection before the addon can re-point `via`.
+    # upstream_cert=false: mint the client-facing cert from SNI, don't probe upstream.
+    MITM_EXTRA="--set connection_strategy=lazy --set upstream_cert=false --set ssl_verify_upstream_trusted_ca=$CAIDO_CA"
+    echo "gateway: Caido CA trusted; chaining inspected flows -> $CAIDO_UPSTREAM."
+  else
+    echo "gateway: WARNING — Caido CA unavailable at $CAIDO_UPSTREAM; starting WITHOUT chaining." >&2
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # mitmproxy (transparent). The addon does allowlist + credential injection.
 # ---------------------------------------------------------------------------
+# shellcheck disable=SC2086  # MITM_EXTRA is intentionally word-split into flags.
 runuser -u "$PROXY_USER" -- mitmdump \
   --mode transparent --showhost \
   --listen-port "$MITM_PORT" \
   --set confdir="$CONFDIR" \
   --set block_global=false \
   --set stream_large_bodies=10m \
+  $MITM_EXTRA \
   -s /opt/broker/broker_addon.py &
 MITM_PID=$!
 

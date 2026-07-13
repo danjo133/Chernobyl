@@ -248,7 +248,13 @@ namespace-scoped) and prefer short-lived tokens — see §7.
 `raw.githubusercontent.com`, `registry.npmjs.org` (+ npm CDN),
 `github.com` / `api.github.com` / `codeload.github.com` / `*.githubusercontent.com`,
 the kube apiserver host, plus per-toolchain (`pypi.org`, `files.pythonhosted.org`, …).
-Editable file. Telemetry domains intentionally **omitted** (disabled instead).
+Telemetry domains intentionally **omitted** (disabled instead).
+
+The live file is **per-sandbox** (`.allowlist-<name>.txt`, seeded from this base on first
+`up`) and **hot-reloaded** by `broker_addon.py` on change. Add entries to a *running*
+sandbox with `sandbox allow --name <n> --url DOMAIN | --ip ADDR` — no teardown, so broker
+credentials (which are memory-only; see §8) are not lost. `sandbox up --allow-url …` seeds
+and appends (deduped); it does not clobber entries added live.
 
 ---
 
@@ -299,6 +305,10 @@ designed in from the start:**
 4. Committed secrets rely on the FUSE hard-deny layer, not gitignore.
 5. Cluster/cloud authz (RBAC/IAM) limits *use* and is orthogonal to credential theft
    — scope it least-privilege.
+6. Broker creds are **memory-only by design** (redis `--save "" --appendonly no`): nothing
+   sensitive at rest, but `sandbox down` wipes them — re-enter via the broker UI after a
+   real teardown. Use `sandbox allow` (hot-reload) for allowlist changes so you don't tear
+   down needlessly. Opting into AOF persistence trades this for plaintext tokens on disk.
 
 ---
 
@@ -308,6 +318,10 @@ designed in from the start:**
   `@devcontainers/cli`.
 - `fuse3` + (rootful only) `user_allow_other`
   (`programs.fuse.userAllowOther = true;` on NixOS).
+- **Unprivileged user namespaces enabled** (for rootless in-workload image builds):
+  `kernel.unprivileged_userns_clone=1`, or NixOS `security.unprivilegedUsernsClone = true;`.
+  Without it, Podman/Buildah inside the workload can't create the namespace a rootless
+  build needs.
 - VS Code + Dev Containers extension (for the editor path).
 
 > **Current blocker — Bash is non-functional in this Claude Code session.** Every
@@ -330,8 +344,9 @@ designed in from the start:**
   devcontainer.Dockerfile    # workspace image: tools + claude-code + trust proxy CA
   gateway/
     Dockerfile               # mitmproxy + iptables + redis client + entrypoint
-    entrypoint.sh            # ip_forward, REDIRECT+NAT rules, start mitmproxy
-    broker_addon.py          # allowlist + scope-checked injection/phantom-swap + guards + redaction
+    entrypoint.sh            # ip_forward, REDIRECT+NAT rules, start redis + control server + mitmproxy
+    broker_addon.py          # allowlist + scope-checked injection/phantom-swap + guards + redaction + request log
+    control_server.py        # gateway-side credential control endpoint (unix socket → redis); write-only/masked
     allowed-domains.txt      # editable egress allowlist
     scopes.yaml              # per-handle / per-host scope rules
   fusefilter/
@@ -340,7 +355,9 @@ designed in from the start:**
   managed-settings.json      # → /etc/claude-code/managed-settings.json
   build-dirs.txt             # per-project list of build/dep dirs to back with volumes
   .env.example
-broker/                       # host-side / MCP credential filler (runs real OAuth, fills redis, mints handles)
+broker/                       # host-side credential tooling (runs real OAuth, fills redis, mints handles)
+  fill.py                     # CLI filler (prints redis commands / future control-socket client)
+  webui.py                    # host-only web UI (127.0.0.1, password-gated): manage creds + watch egress log
 sandbox                       # CLI: up | ls | down | open — worktree, project naming, ports, resource limits
 docs/SANDBOX-PLAN.md          # this document
 ```
@@ -486,3 +503,155 @@ or allowlist its download/marketplace endpoints.
   pre-bake IDE backend into the image + docs + allowlist tuning.
 - **P10** Hardening + tests: egress-denial, secret-leak, credential-non-readability,
   confused-deputy, cross-sandbox isolation, rebuild-persistence.
+- **P11** Broker management UI (§15): gateway control endpoint over the control socket,
+  redacted egress request log, host-side password-gated web app. Verify the surface is
+  unreachable from the workload, secrets are never read back, and CSRF/rebinding guards hold.
+
+---
+
+## 15. Broker management UI — set credentials, watch egress
+
+A password-gated web app to manage credentials (inject-by-host headers, scoped phantom
+handles) and watch the redacted egress log, instead of hand-piping `redis-cli`. The
+design is dominated by one constraint, and getting it wrong inverts the whole model.
+
+### 15.1 The load-bearing decision: the UI runs on the HOST, not the gateway
+
+The workload shares the gateway's **network namespace** (`network_mode: service:gateway`).
+So anything listening on a port *inside* the gateway is reachable from the workload at
+`localhost`. A credential-management server there — even password-protected — would put a
+secret-bearing, secret-*setting* surface one `curl localhost:PORT` away from the very
+autonomous code we keep credentials from. **That inverts the threat model.**
+
+So the web app runs as a **host process**, bound to the host's `127.0.0.1` — a different
+loopback than the container's, which the workload cannot reach. It never publishes a port
+into the gateway netns. It reaches the gateway only over a **unix control socket** in the
+bind-mounted control dir. Both channels exploit that the workload shares the gateway's
+*network* ns but **not** its *mount* ns:
+
+```
+ BROWSER ──► 127.0.0.1:9999 (HOST loopback — invisible to the workload)
+                │  served by broker/webui.py, launched by the `sandbox` CLI
+                ▼
+   .broker-control-<name>/broker.sock        (host ⇄ gateway, NOT in the workload's mount ns)
+   .broker-control-<name>/requests.log        (gateway appends redacted JSONL; host tails)
+                │
+   GATEWAY: control_server.py ──► redis (real creds)   broker_addon.py ──► request log
+                ▲
+   WORKLOAD shares the gateway NETNS but not its MOUNT ns → cannot see the socket,
+   the log, or the host's :9999. Same argument that already protects redis.
+```
+
+### 15.2 Components
+
+| Where | File | Role |
+|---|---|---|
+| gateway | `control_server.py` | listens on `/run/broker-control/broker.sock`; the only write path into the cred store. Ops: `host_set/list/del`, `hostpat_set/del` (wildcard/subdomain records), `handle_mint/list/revoke`. Runs as the unprivileged proxy uid (same as redis). |
+| gateway | `broker_addon.py` | also appends **redacted** JSONL to `/run/broker-control/requests.log`: ts, decision (`ALLOW/DENY/INJECT/DENY_SCOPE/SPLICE`), method, host, path. Never header *values* (only injected names), never bodies, query string stripped. Size-capped ring. |
+| host | `broker/webui.py` | stdlib-only web app, binds `127.0.0.1`. Password login → session cookie. Forms for host-headers (one domain per line — plain host = exact; `*.x.com`/`.x.com` = that domain + all subdomains, for non-secret markers across a bug-bounty scope) + handles; auto-refreshing log table. Talks to the control socket; tails the log. |
+
+> **Exact vs wildcard injection.** Exact records (`broker:host:<host>`) stay strict — the
+> confused-deputy guard for real credentials. Wildcard/subdomain records
+> (`broker:hostpats` HASH, opt-in by typing `*.`/`.`) match a host *and all its subdomains*
+> and are intended for **non-secret markers** (e.g. a bug-bounty `X-Tag`), since they
+> broadcast the header to every subdomain reached. On a request both tiers are merged, the
+> exact record winning on conflict — so a scope-wide marker and a host-specific token coexist.
+| host | `sandbox` CLI | `up` mints the password (`.broker-control-<name>/webui-password`, mode 600) and launches the UI on an **auto-assigned free port** (first free from 9999, skipping ports other sandboxes claim; stable across restarts via `webui-port`); `ls` prints each sandbox's URL + password + status; `down` stops it; `web [--stop]` (re)starts after a host reboot. `--web-port N` overrides. |
+
+### 15.3 Security properties
+
+- **Crown-jewel rule — write-only / show-masked.** The control server *can* read secrets
+  (it must, to store them) but **never returns them**: list ops mask to a last-4 hint. You
+  change a secret by overwriting, remove it by deleting/revoking. A freshly minted handle
+  is shown **once** (it must be dropped into the sandbox); the backing header is masked.
+  A leaked password can revoke/overwrite but cannot **exfiltrate** stored creds.
+- **Authn + CSRF + anti-rebinding.** Per-`up` high-entropy password (600), constant-time
+  compare, `HttpOnly; SameSite=Strict` session cookie. Every mutating POST checks `Origin`
+  (hostname must be exactly `127.0.0.1`/`localhost` — **port-agnostic**, so SSH-forwarding to
+  any local port still works; a cross-site attacker is never served from loopback); every
+  request checks the `Host` header against the same loopback allowlist (defeats DNS-rebinding
+  from a malicious page). Body size capped.
+- **Reachability.** Socket + log live in the host-private control dir, never bind-mounted
+  into the workload. The dir is made writable by the proxy uid (cross-uid bind mount, no
+  userns) — a **single-user-host assumption**: loose dir perms only expose other *local*
+  host users, who could already read the password file. Not multi-tenant-host safe.
+- **Redaction.** The log is decisions, not contents — safe to leave tailing in a browser.
+
+### 15.4 Remote access — SSH-forward, never bind to the wire
+
+The UI binds **`127.0.0.1` on the devbox only**, deliberately. To reach it from a desktop,
+**SSH local-forward** — do not bind it to `0.0.0.0`/the external IP:
+
+```
+ssh -L 9999:127.0.0.1:9999 devbox      # then browse http://localhost:9999 on the desktop
+```
+
+Why not bind externally: this is a credential-*setting* surface. Putting it on the LAN/
+external interface makes the app password the only thing between the whole network and your
+secret store, and forces a firewall hole. SSH-forwarding keeps it off the wire entirely —
+transport auth is SSH (keys), the tunnel is encrypted, no firewall change, and the
+loopback `Host`/`Origin` guards still pass (the forwarded request arrives as
+`Host: localhost`). The port-agnostic `Origin` check (§15.3) means you may forward to any
+local port (`-L 8080:127.0.0.1:9999`) without breaking CSRF protection.
+
+Note on the workload: binding `0.0.0.0` would *not* directly expose the UI to the sandbox
+(its egress is dropped by the gateway firewall to non-allowlisted, non-80/443 destinations),
+but it would expose it to every other host on the network — which is reason enough.
+
+### 15.5 Status
+
+Built (P11), unit-smoke-tested host-side (auth, cookie flags, Origin/Host rejection, masked
+read-back, control round-trip). Still needs a real `docker compose up` pass end-to-end with
+the gateway — same standing blocker as the rest of the scaffold (§9). The redis-cli seeding
+path (§4, `broker/README.md`) remains as a fallback and for scripting.
+
+---
+
+## 16. Bug-bounty tools sidecar (bb-hunter)
+
+The hunting toolset (`tooling/docker/`, a curated Kali image — subfinder/httpx/nuclei/
+ffuf/katana/dalfox/sqlmap/jadx/…) is a **separate, independently-built image**, brought
+into the sandbox as an **opt-in sidecar** rather than merged into the workload image
+(different base, heavy independent build, its own bare-VM install path).
+
+**Topology.** `sandbox up --tools` layers `compose.tools.yaml`, adding a `tools` service:
+`network_mode: service:gateway` (so tool egress goes through the firewall + broker, same
+containment as the workload), `cap_drop: ALL`, `no-new-privileges`, `user: hunter`, the
+same FUSE `/workspace`, the gateway public CA at `/ca`, and a shared `bb-hunter-wordlists`
+volume. The standalone `tooling/docker/compose.yml` (with its own mitmproxy + full egress)
+is unchanged; this is the integrated variant.
+
+**Claude drives it over SSH.** The sidecar runs **dropbear as `hunter`** on
+`127.0.0.1:2222` — reachable only from the sibling devcontainer over the shared gateway
+netns. OpenSSH sshd is unusable here (its setuid privsep can't run under cap_drop:ALL +
+no-new-privileges); dropbear serving its own user needs no setuid and no caps, and so
+*cannot* setuid to the proxy uid to bypass the firewall. The CLI mints an ed25519 keypair
+per sandbox (`.tools-<name>/`), injects the pubkey as the sidecar's `authorized_keys`, and
+installs an ssh alias + a `hunter` PATH wrapper in the devcontainer. Claude runs
+`hunter nuclei -u https://…` (the wrapper loads the gateway-CA env, then execs in the
+sidecar); output lands in the shared workspace. The scope-guard hook still sees the target
+host in the command, so it keeps gating.
+
+**`sandbox tools`** drops *you* into the contained sidecar (`exec tools bash -l`) for manual
+checks. **`sandbox tools --unrestricted`** spins up an ephemeral, **full-internet**
+bb-hunter box (own netns, NET_RAW+NET_ADMIN, repo mounted) for manual `nmap`/`dns`/raw
+recon the gateway would otherwise drop — deliberately *outside* containment, human-driven
+only.
+
+**Egress for tools (current scope: http/https/ws/wss).** Tool HTTP(S) goes through the
+gateway like everything else: each target must be allowlisted, and traffic is MITM'd unless
+the host is marked passthrough (`!host`). Recommended for scanning: **passthrough the scope**
+(`!target.com`, wildcard-capable) so tools get real TLS and accurate results, and set any
+marker header via the tools' own `-H` flags. Raw port-scanning (`nmap`/`naabu` on arbitrary
+ports) is still dropped by the gateway — that needs the future scope-passthrough egress tier
+(§15-style), deferred; use `--unrestricted` for now.
+
+**Two scope gates, keep in sync.** `tooling/scope-guard.py` (agent PreToolUse hook,
+`recon/active-scope.yaml`) and the gateway allowlist are complementary defense-in-depth;
+ideally drive both from one scope source. The hook only fires for *Claude*-run commands —
+a manual `sandbox tools` shell is gated by the gateway only.
+
+**Status:** built, static-checked (shell/YAML/wrapper-quoting). Needs a real host bring-up
+to validate the rootless-dropbear login, cross-uid key mounts, and `hunter` wrapper — the
+in-sandbox session has no Docker socket. Prereq: pre-build `bb-hunter:latest`
+(`cd tooling/docker && docker compose build`).

@@ -7,6 +7,7 @@ RUN apt-get update \
       iptables \
       redis-server \
       ca-certificates \
+      openssl \
       python3 python3-pip python3-venv \
       jq curl netcat-openbsd \
  && rm -rf /var/lib/apt/lists/*

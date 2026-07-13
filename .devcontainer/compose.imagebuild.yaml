@@ -1,0 +1,21 @@
+# Opt-in overlay — loosen syscall confinement so the workload can run rootless
+# Podman/Buildah image builds. Applied ONLY when you pass `--allow-image-build`
+# (alias `--disable-seccomp`) to `./sandbox up`, which adds this as a second
+# `-f` compose file. The base compose.yaml keeps the hardened default otherwise.
+#
+# Why it's needed: a rootless build creates a user namespace via
+# unshare(CLONE_NEWUSER); the default seccomp profile gates that syscall on
+# CAP_SYS_ADMIN, which the workload drops. `unconfined` re-opens the namespace
+# syscalls ONLY — cap_drop:ALL + no-new-privileges still hold, and the gateway's
+# egress rules live in a netns this container has no caps over, so it still cannot
+# rewrite them. The cost is widened kernel attack surface (a stated non-goal,
+# §1/§8), not privilege.
+#
+# Mechanics: Compose CONCATENATES security_opt across files, so these two entries
+# append to the base service's `no-new-privileges:true` rather than replacing it.
+# apparmor=unconfined is a no-op on hosts without AppArmor (e.g. NixOS).
+services:
+  devcontainer:
+    security_opt:
+      - "seccomp=unconfined"
+      - "apparmor=unconfined"

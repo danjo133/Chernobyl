@@ -1,0 +1,84 @@
+# Overlay: bug-bounty tools sidecar (bb-hunter). Layered by `sandbox up --tools`.
+# Lifecycle-coupled with the sandbox; shares the gateway netns (egress through the
+# firewall + broker, same containment as the workload) and the FUSE workspace.
+# Claude drives it over loopback SSH; `sandbox tools` drops you into it. The
+# standalone tooling/docker/ stack is unchanged — this is the integrated variant.
+# See docs/SANDBOX-PLAN.md §16.
+services:
+  devcontainer:
+    # Claude reads its private key (ro) + gets the ssh alias / `hunter` wrapper.
+    volumes:
+      - ${TOOLS_SSH_DIR:-./.tools-placeholder}:/home/node/.ssh-hunter:ro
+      - ./tools-client-setup.sh:/usr/local/bin/tools-client-setup.sh:ro
+
+  gateway:
+    # Tell the entrypoint to chain inspected flows to Caido (which it brings up CA
+    # trust for). Egress flow becomes:  workload/tools -> mitmproxy (allowlist +
+    # real creds injected) -> caido (intercept/replay) -> target. depends_on is
+    # start-ordering only; readiness is the entrypoint's CA-fetch retry loop.
+    environment:
+      CAIDO_UPSTREAM: "caido:8081"
+    depends_on:
+      - caido
+    # mitmproxy only starts listening AFTER fetching Caido's CA (up to ~60s if Caido
+    # is cold-starting), so widen the health grace — failures here don't count until
+    # start_period elapses. Keeps the workload's `gateway: service_healthy` wait honest.
+    healthcheck:
+      start_period: 90s
+
+  # Operator's interactive proxy. Its OWN netns (NOT service:gateway) so it sits
+  # OUTSIDE the transparent-redirect — otherwise its onward traffic would loop back
+  # into mitmproxy. Only mitmproxy (uid-exempt) can reach it; the workload + tools
+  # are filtered to loopback/DNS/mitmproxy, so they can't use it as an open door.
+  # Split UI/proxy ports are required behind Docker port-forwarding (the single-port
+  # traffic-splitter misfires). Web workbench at http://127.0.0.1:${CAIDO_UI_PORT}.
+  caido:
+    image: caido/caido:latest
+    networks: [egress]
+    command:
+      - caido-cli
+      - --ui-listen
+      - 0.0.0.0:8080
+      - --proxy-listen
+      - 0.0.0.0:8081
+      - --no-open               # headless: no auto-browser; sign in via the web UI
+      - --no-renderer-sandbox   # Chromium sandbox is unavailable in-container
+    volumes:
+      # Per-sandbox (project-scoped) so projects/history/CA + your one-time account
+      # login persist across down/up. NOT shared between sandboxes: concurrent
+      # caido-cli on one data dir would corrupt it.
+      - caido-data:/home/caido/.local/share/caido
+    ports:
+      - "127.0.0.1:${CAIDO_UI_PORT:-7000}:8080"
+    restart: unless-stopped
+
+  tools:
+    build:
+      context: ./tools
+      args:
+        HUNTER_IMAGE: ${HUNTER_IMAGE:-bb-hunter:latest}
+    image: bb-hunter-sandbox:latest
+    network_mode: "service:gateway"        # contained egress, same as the workload
+    depends_on:
+      gateway:
+        condition: service_healthy
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    user: hunter
+    working_dir: /workspace
+    environment:
+      TOOLS_SSH_PORT: "${TOOLS_SSH_PORT:-2222}"
+    volumes:
+      - ${SANDBOX_MOUNT:-./.tools-placeholder}:/workspace        # same FUSE view Claude sees
+      - ca-pub:/ca:ro                                            # gateway PUBLIC CA only
+      - bb-hunter-wordlists:/opt/wordlists                       # shared; populate once (README)
+      - ${TOOLS_SSH_DIR:-./.tools-placeholder}:/etc/hunter-ssh:ro  # authorized_keys (pubkey)
+    restart: unless-stopped
+
+volumes:
+  # Global name (not project-scoped) so wordlists persist across sandboxes and are
+  # reachable by the unrestricted `sandbox tools --unrestricted` box too.
+  bb-hunter-wordlists:
+    name: bb-hunter-wordlists
+  # Project-scoped: each sandbox keeps its own Caido projects + account login.
+  caido-data:

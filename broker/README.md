@@ -16,10 +16,17 @@ ${BROKER_CONTROL_DIR:-./.broker-control}  (host)  ->  /run/broker-control  (gate
 
 `fill.py` runs on the host and writes credential records that the gateway reads.
 
-> **TODO (P5):** the cleanest transport is a tiny broker control endpoint inside the
-> gateway listening on `/run/broker-control/broker.sock`, which validates and writes
-> into redis. The skeleton below assumes that endpoint exists. Until it's built, you
-> can seed redis directly via `docker compose exec gateway redis-cli -s /run/broker/redis.sock`.
+> **Two front-ends, same store:**
+> - **`webui.py`** — host-only, password-gated web app (see `docs/SANDBOX-PLAN.md` §15).
+>   Launched by `./sandbox up`; URL + password shown by `./sandbox ls`. Set inject-by-host
+>   headers, mint/revoke scoped handles, and watch the redacted egress log. This is the
+>   normal path.
+> - **`fill.py`** — scripting/CLI filler. Currently prints the redis commands to seed
+>   directly via `docker compose exec gateway redis-cli -s /run/broker/redis.sock`.
+>
+> Both go through the gateway's control endpoint (`gateway/control_server.py`, listening on
+> `/run/broker-control/broker.sock`) or redis. The endpoint is the only write path into the
+> store and is reachable from the host but **not** from the workload (different mount ns).
 
 ## What it writes (redis schema)
 
