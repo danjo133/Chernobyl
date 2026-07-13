@@ -2,12 +2,18 @@
 # sandbox — manage Claude Code sandboxes. See docs/SANDBOX-PLAN.md.
 #
 #   sandbox up   --source PATH [--name NAME] [--worktree BRANCH] [--port HOST:CTR]
+#                [--tools]                 add the bb-hunter tools sidecar (Claude drives it over SSH)
+#                [--web-port N]            host-only broker UI port (default: first free from 9999)
 #                [--allow-url DOMAIN]...   add domain(s) to the egress allowlist
 #                [--allow-ip IP]...        add IP(s) to the egress allowlist
 #                [--allow-internet]        UNRESTRICTED egress (no allowlist, no MITM)
-#   sandbox ls
+#                [--allow-image-build]     seccomp=unconfined, so rootless podman/buildah can build images
+#   sandbox ls                          # lists sandboxes + their broker UI URL + password
+#   sandbox allow [--name NAME] --url DOMAIN | --ip ADDR ...   # add egress entries LIVE (no restart)
 #   sandbox down [--name NAME]
 #   sandbox open [--name NAME]          # exec an interactive Claude Code session
+#   sandbox web  [--name NAME] [--port N] [--stop]   # (re)start/stop the host broker UI
+#   sandbox tools [--name NAME] [--unrestricted] [-- CMD...]   # shell into the hunter sidecar (or run CMD)
 #
 # Each sandbox is a compose project (COMPOSE_PROJECT_NAME) -> isolated networks/volumes.
 # Parallel sandboxes = different --name (and ideally different --worktree of a repo).
@@ -17,6 +23,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DC="$HERE/.devcontainer"
 COMPOSE=(docker compose -f "$DC/compose.yaml")
+WEBUI_PY="$HERE/broker/webui.py"
+WEB_PORT_DEFAULT=9999
 
 # Shared, per-user (NOT per-sandbox) Claude home: auth + settings + agents/skills +
 # session logs, bind-mounted into every sandbox. Login once; every sandbox inherits it.
@@ -25,6 +33,74 @@ SANDBOX_CLAUDE_HOME="${SANDBOX_CLAUDE_HOME:-$HOME/.sandbox/claude-home}"
 MINIONS_DIR="${MINIONS_DIR:-$HOME/dev/Minions}"
 
 die() { echo "sandbox: $*" >&2; exit 1; }
+
+# --- host-side credential/log web UI (one per sandbox) ----------------------
+# Runs on the host (127.0.0.1 only), gated by a per-sandbox password, talking to
+# the gateway over the control socket. NEVER published into the gateway netns —
+# that's reachable from the workload. See docs/SANDBOX-PLAN.md §15.
+webui_start() {  # NAME  CTRL_DIR  PORT
+  local name="$1" ctrl="$2" port="$3"
+  local pwf="$ctrl/webui-password" pidf="$ctrl/webui.pid"
+  [ -f "$pwf" ] || { umask 077; python3 -c 'import secrets;print(secrets.token_urlsafe(18))' > "$pwf"; }
+  echo "$port" > "$ctrl/webui-port"
+  if [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then return 0; fi  # already running
+  nohup python3 "$WEBUI_PY" --socket "$ctrl/broker.sock" --log "$ctrl/requests.log" \
+    --password-file "$pwf" --port "$port" >> "$ctrl/webui.log" 2>&1 &
+  echo $! > "$pidf"
+}
+webui_stop() {  # CTRL_DIR
+  local pidf="$1/webui.pid" pid
+  if [ -f "$pidf" ]; then
+    pid="$(cat "$pidf")"
+    kill "$pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done  # wait for clean exit before any rebind
+  fi
+  rm -f "$pidf"
+}
+# Pick a host port for this sandbox's UI: reuse its own if already assigned (stable
+# across restarts), else the first free port from 9999 up that no OTHER sandbox claims.
+assign_web_port() {  # NAME -> echoes port
+  local name="$1" used="" f
+  local ownfile="$DC/.broker-control-$name/webui-port"   # separate line: $name must be set first (set -u)
+  [ -f "$ownfile" ] && { cat "$ownfile"; return; }
+  for f in "$DC"/.broker-control-*/webui-port; do [ -f "$f" ] && used="$used $(cat "$f")"; done
+  python3 -c '
+import socket, sys
+used = set(sys.argv[1].split())
+for p in range(9999, 9999 + 300):
+    if str(p) in used:
+        continue
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", p)); s.close(); print(p); break
+    except OSError:
+        s.close()
+else:
+    sys.exit("sandbox: no free web port in 9999-10298")
+' "$used"
+}
+# Pick a stable host port for this sandbox's Caido web UI (range 8090+, distinct from
+# the broker web UI's 9999+), reusing its own if already assigned. Mirrors assign_web_port.
+assign_caido_port() {  # NAME -> echoes port
+  local name="$1" used="" f
+  local ownfile="$DC/.broker-control-$name/caido-port"
+  [ -f "$ownfile" ] && { cat "$ownfile"; return; }
+  for f in "$DC"/.broker-control-*/caido-port; do [ -f "$f" ] && used="$used $(cat "$f")"; done
+  python3 -c '
+import socket, sys
+used = set(sys.argv[1].split())
+for p in range(8090, 8090 + 300):
+    if str(p) in used:
+        continue
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", p)); s.close(); print(p); break
+    except OSError:
+        s.close()
+else:
+    sys.exit("sandbox: no free caido port in 8090-8389")
+' "$used"
+}
 
 # Populate the shared Claude home (idempotent). Symlinks target the CONTAINER path
 # (/home/node/dev/Minions) — dangling on the host, valid inside every sandbox.
@@ -47,15 +123,19 @@ cmd="${1:-help}"; shift || true
 
 case "$cmd" in
   up)
-    SOURCE=""; NAME=""; WORKTREE=""; PORT=""; ALLOW_INTERNET=0; ALLOW_EXTRA=""
+    SOURCE=""; NAME=""; WORKTREE=""; PORT=""; ALLOW_INTERNET=0; ALLOW_EXTRA=""; ALLOW_IMAGE_BUILD=0; TOOLS=0
+    WEB_PORT=""   # empty -> auto-assign a free port per sandbox (below)
     while [ $# -gt 0 ]; do case "$1" in
       --source) SOURCE="$2"; shift 2;;
       --name) NAME="$2"; shift 2;;
       --worktree) WORKTREE="$2"; shift 2;;
       --port) PORT="$2"; shift 2;;
+      --web-port) WEB_PORT="$2"; shift 2;;
+      --tools) TOOLS=1; shift;;
       --allow-internet) ALLOW_INTERNET=1; shift;;
       --allow-url) ALLOW_EXTRA="$ALLOW_EXTRA $2"; shift 2;;
       --allow-ip)  ALLOW_EXTRA="$ALLOW_EXTRA $2"; shift 2;;
+      --allow-image-build|--disable-seccomp) ALLOW_IMAGE_BUILD=1; shift;;
       *) die "unknown arg $1";;
     esac; done
     [ -n "$SOURCE" ] || die "--source is required"
@@ -78,18 +158,17 @@ case "$cmd" in
 
     setup_claude_home
 
-    # Per-sandbox egress allowlist: base file + any --allow-url/--allow-ip entries.
+    # Per-sandbox egress allowlist — ALWAYS a per-sandbox file (seeded from the base on
+    # first up), so it is the durable, hot-editable source of truth. Re-running `up`
+    # appends new --allow-url/--allow-ip entries (deduped) without clobbering live edits
+    # made via `sandbox allow`. broker_addon.py hot-reloads it on change — no restart.
     # (Ignored when --allow-internet, which bypasses the proxy entirely.)
-    ALLOWLIST_FILE="$DC/gateway/allowed-domains.txt"
-    if [ -n "$ALLOW_EXTRA" ]; then
-      ALLOWLIST_FILE="$DC/.allowlist-$NAME.txt"
-      {
-        cat "$DC/gateway/allowed-domains.txt"
-        echo ""
-        echo "# --- per-sandbox additions ($NAME) ---"
-        for h in $ALLOW_EXTRA; do echo "$h"; done
-      } > "$ALLOWLIST_FILE"
+    ALLOWLIST_FILE="$DC/.allowlist-$NAME.txt"
+    if [ ! -f "$ALLOWLIST_FILE" ]; then
+      cp "$DC/gateway/allowed-domains.txt" "$ALLOWLIST_FILE"
+      printf '\n# --- per-sandbox additions (%s) ---\n' "$NAME" >> "$ALLOWLIST_FILE"
     fi
+    for h in $ALLOW_EXTRA; do grep -qxF "$h" "$ALLOWLIST_FILE" || echo "$h" >> "$ALLOWLIST_FILE"; done
 
     # Write the env compose + mount.sh consume.
     cat > "$DC/.env" <<EOF
@@ -107,6 +186,34 @@ EOF
     mkdir -p "$DC/.broker-control-$NAME"
     [ "$ALLOW_INTERNET" = "1" ] && echo "sandbox: WARNING — --allow-internet: egress is UNRESTRICTED (no allowlist, no MITM)." >&2
 
+    # Opt-in: loosen syscall confinement so rootless Podman/Buildah can build images.
+    # Layers the overlay compose file (appends seccomp/apparmor=unconfined). The default
+    # keeps the hardened profile, under which `podman build` fails at namespace setup.
+    if [ "$ALLOW_IMAGE_BUILD" = "1" ]; then
+      COMPOSE+=(-f "$DC/compose.imagebuild.yaml")
+      echo "sandbox: WARNING — --allow-image-build: workload runs seccomp=unconfined (looser kernel syscall confinement) to permit rootless image builds. cap_drop:ALL + no-new-privileges still hold; egress rules remain out of reach." >&2
+    fi
+
+    # Opt-in: bug-bounty tools sidecar (bb-hunter). Lifecycle-coupled; shares the
+    # gateway netns (contained egress) + FUSE workspace. Claude drives it over
+    # loopback SSH. Needs bb-hunter:latest pre-built (tooling/docker/). See §16.
+    if [ "$TOOLS" = "1" ]; then
+      HUNTER_IMAGE="${HUNTER_IMAGE:-bb-hunter:latest}"
+      docker image inspect "$HUNTER_IMAGE" >/dev/null 2>&1 \
+        || die "tools: image '$HUNTER_IMAGE' not found — build it first: (cd tooling/docker && docker compose build)"
+      TOOLS_SSH_DIR="$DC/.tools-$NAME"; mkdir -p "$TOOLS_SSH_DIR"; chmod 700 "$TOOLS_SSH_DIR"
+      if [ ! -f "$TOOLS_SSH_DIR/id_hunter" ]; then
+        ssh-keygen -t ed25519 -N '' -q -f "$TOOLS_SSH_DIR/id_hunter" -C "claude@sandbox-$NAME"
+        cp "$TOOLS_SSH_DIR/id_hunter.pub" "$TOOLS_SSH_DIR/authorized_keys"
+      fi
+      chmod 600 "$TOOLS_SSH_DIR/id_hunter"; chmod 644 "$TOOLS_SSH_DIR/id_hunter.pub" "$TOOLS_SSH_DIR/authorized_keys"
+      COMPOSE+=(-f "$DC/compose.tools.yaml")
+      # Caido (operator's proxy) UI port — stable per sandbox, host-local only.
+      CAIDO_UI_PORT="$(assign_caido_port "$NAME")"
+      echo "$CAIDO_UI_PORT" > "$DC/.broker-control-$NAME/caido-port"
+      { echo "TOOLS_SSH_DIR=$TOOLS_SSH_DIR"; echo "TOOLS_SSH_PORT=2222"; echo "HUNTER_IMAGE=$HUNTER_IMAGE"; echo "CAIDO_UI_PORT=$CAIDO_UI_PORT"; } >> "$DC/.env"
+    fi
+
     "$DC/fusefilter/mount.sh"
     COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" --env-file "$DC/.env" up -d --build
     # postCreateCommand only runs under VS Code — on this headless path the CA
@@ -115,11 +222,83 @@ EOF
       exec -u root devcontainer /usr/local/bin/trust-ca.sh   # system store
     COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" --env-file "$DC/.env" \
       exec devcontainer /usr/local/bin/trust-ca.sh           # node home (NODE_EXTRA_CA_CERTS)
+
+    # Tools sidecar: wire the devcontainer's SSH client to the hunter box (2 passes).
+    if [ "$TOOLS" = "1" ]; then
+      COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" --env-file "$DC/.env" \
+        exec -u root devcontainer /usr/local/bin/tools-client-setup.sh   # 'hunter' wrapper
+      COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" --env-file "$DC/.env" \
+        exec devcontainer /usr/local/bin/tools-client-setup.sh           # ssh alias 'hunter'
+      echo "sandbox: tools sidecar up. Claude runs:  hunter <cmd>   (e.g. hunter nuclei -u https://...)"
+      echo "sandbox: manual shell:  ./sandbox tools --name $NAME   |   unrestricted box:  ./sandbox tools --name $NAME --unrestricted"
+      echo "sandbox: Caido workbench -> http://127.0.0.1:${CAIDO_UI_PORT:-7000}  (first run: sign in to your Caido account; all inspected egress flows through it)"
+    fi
+
+    # Host-side credential/log web UI for this sandbox (auto-assigned free port).
+    [ -n "$WEB_PORT" ] || WEB_PORT="$(assign_web_port "$NAME")"
+    webui_start "$NAME" "$DC/.broker-control-$NAME" "$WEB_PORT"
     echo "sandbox: '$NAME' up. Open with:  ./sandbox open --name $NAME"
+    echo "sandbox: broker UI at http://127.0.0.1:$WEB_PORT  (password via ./sandbox ls)"
     ;;
 
   ls)
     docker compose ls
+    echo ""
+    echo "Broker UIs (host-only; password unlocks credential + log management):"
+    shopt -s nullglob
+    found=0
+    for ctrl in "$DC"/.broker-control-*/; do
+      [ -f "$ctrl/webui-password" ] || continue
+      found=1
+      name="$(basename "$ctrl")"; name="${name#.broker-control-}"
+      port="$(cat "$ctrl/webui-port" 2>/dev/null || echo "$WEB_PORT_DEFAULT")"
+      status="stopped"
+      if [ -f "$ctrl/webui.pid" ] && kill -0 "$(cat "$ctrl/webui.pid")" 2>/dev/null; then status="running"; fi
+      printf "  %-22s http://127.0.0.1:%-5s  password: %s  (%s)\n" \
+        "$name" "$port" "$(cat "$ctrl/webui-password")" "$status"
+    done
+    [ "$found" = 0 ] && echo "  (none)"
+    ;;
+
+  allow)
+    # Add egress allowlist entries to a RUNNING sandbox — hot-reloaded, no teardown,
+    # so broker credentials survive. This is the way to change allowed URLs.
+    NAME=""; EXTRA=""
+    while [ $# -gt 0 ]; do case "$1" in
+      --name) NAME="$2"; shift 2;;
+      --url|--ip) EXTRA="$EXTRA $2"; shift 2;;
+      *) die "unknown arg $1";;
+    esac; done
+    [ -n "$NAME" ] || { [ -f "$DC/.env" ] && . "$DC/.env" && NAME="$SANDBOX_NAME"; }
+    [ -n "$NAME" ] || die "--name required"
+    [ -n "$EXTRA" ] || die "give at least one --url DOMAIN or --ip ADDR"
+    AF="$DC/.allowlist-$NAME.txt"
+    [ -f "$AF" ] || die "no allowlist for '$NAME' (is it up? run: ./sandbox up ...)"
+    for h in $EXTRA; do
+      if grep -qxF "$h" "$AF"; then echo "sandbox: $h already allowed";
+      else echo "$h" >> "$AF"; echo "sandbox: + $h"; fi
+    done
+    echo "sandbox: allowlist hot-reloaded (no restart; broker applies it on the next request)."
+    ;;
+
+  web)
+    NAME=""; WEB_PORT=""; STOP=0
+    while [ $# -gt 0 ]; do case "$1" in
+      --name) NAME="$2"; shift 2;;
+      --port) WEB_PORT="$2"; shift 2;;
+      --stop) STOP=1; shift;;
+      *) die "unknown arg $1";;
+    esac; done
+    [ -n "$NAME" ] || { [ -f "$DC/.env" ] && . "$DC/.env" && NAME="$SANDBOX_NAME"; }
+    [ -n "$NAME" ] || die "--name required"
+    CTRL="$DC/.broker-control-$NAME"
+    [ -d "$CTRL" ] || die "no such sandbox control dir: $CTRL"
+    [ -n "$WEB_PORT" ] || WEB_PORT="$(assign_web_port "$NAME")"   # reuse this sandbox's port
+    if [ "$STOP" = 1 ]; then webui_stop "$CTRL"; echo "sandbox: broker UI for '$NAME' stopped."; else
+      # Restart-by-default: stop any running instance first so this picks up UI changes.
+      webui_stop "$CTRL"; webui_start "$NAME" "$CTRL" "$WEB_PORT"
+      echo "sandbox: broker UI for '$NAME' (re)started at http://127.0.0.1:$WEB_PORT (password via ./sandbox ls)"
+    fi
     ;;
 
   down)
@@ -127,8 +306,42 @@ EOF
     while [ $# -gt 0 ]; do case "$1" in --name) NAME="$2"; shift 2;; *) die "unknown arg $1";; esac; done
     [ -n "$NAME" ] || { [ -f "$DC/.env" ] && . "$DC/.env" && NAME="$SANDBOX_NAME"; }
     [ -n "$NAME" ] || die "--name required (or run from a configured sandbox)"
-    COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" down
+    webui_stop "$DC/.broker-control-$NAME"
+    # Include the tools overlay if this sandbox used it, so the sidecar is torn down too.
+    [ -d "$DC/.tools-$NAME" ] && COMPOSE+=(-f "$DC/compose.tools.yaml")
+    COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" --env-file "$DC/.env" down
     "$DC/fusefilter/unmount.sh" "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/devfilter/$NAME" || true
+    ;;
+
+  tools)
+    # Drop into the contained bb-hunter sidecar, run a one-off command in it, or
+    # (--unrestricted) spin up an ephemeral FULL-internet hunting box for manual
+    # nmap/dns/raw recon that the gateway would otherwise block. See §16.
+    NAME=""; UNRESTRICTED=0
+    while [ $# -gt 0 ]; do case "$1" in
+      --name) NAME="$2"; shift 2;;
+      --unrestricted|--full-internet) UNRESTRICTED=1; shift;;
+      --) shift; break;;
+      -*) die "unknown arg $1";;
+      *) break;;
+    esac; done
+    [ -n "$NAME" ] || { [ -f "$DC/.env" ] && . "$DC/.env" && NAME="$SANDBOX_NAME"; }
+    [ -n "$NAME" ] || die "--name required"
+    [ -f "$DC/.env" ] && . "$DC/.env"
+    if [ "$UNRESTRICTED" = "1" ]; then
+      echo "sandbox: WARNING — unrestricted tools box: FULL internet (NOT through the gateway), NET_RAW+NET_ADMIN, your repo mounted. Manual use only; not the contained agent path." >&2
+      exec docker run --rm -it \
+        --cap-drop ALL --cap-add NET_RAW --cap-add NET_ADMIN \
+        -v "${SANDBOX_SOURCE:-$PWD}:/workspace" -v bb-hunter-wordlists:/opt/wordlists -w /workspace \
+        "${HUNTER_IMAGE:-bb-hunter:latest}" bash
+    fi
+    [ -d "$DC/.tools-$NAME" ] || die "tools sidecar not enabled for '$NAME' — bring it up with: ./sandbox up --tools ..."
+    COMPOSE_T=(docker compose -f "$DC/compose.yaml" -f "$DC/compose.tools.yaml" --env-file "$DC/.env")
+    if [ "$#" -gt 0 ]; then
+      COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE_T[@]}" exec tools "$@"        # one-off command
+    else
+      COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE_T[@]}" exec tools bash -l     # interactive shell
+    fi
     ;;
 
   open)
@@ -141,6 +354,6 @@ EOF
     ;;
 
   *)
-    sed -n '2,15p' "$0"
+    sed -n '2,19p' "$0"
     ;;
 esac
