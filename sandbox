@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # sandbox — manage Claude Code sandboxes. See docs/SANDBOX-PLAN.md.
 #
-#   sandbox up   --source PATH [--name NAME] [--worktree BRANCH] [--port HOST:CTR]
+#   sandbox up   --source PATH [--name NAME] [--worktree BRANCH]
+#                [--port HOST:CTR]         publish an app port (default: auto-assign a free
+#                                          host port from 3000 up -> container :3000)
 #                [--tools]                 add the bb-hunter tools sidecar (Claude drives it over SSH)
 #                [--web-port N]            host-only broker UI port (default: first free from 9999)
 #                [--allow-url DOMAIN]...   add domain(s) to the egress allowlist
 #                [--allow-ip IP]...        add IP(s) to the egress allowlist
 #                [--allow-internet]        UNRESTRICTED egress (no allowlist, no MITM)
 #                [--allow-image-build]     seccomp=unconfined, so rootless podman/buildah can build images
-#   sandbox ls                          # lists sandboxes + their broker UI URL + password
+#   sandbox ls                          # sandboxes + broker UI / app / caido ports + password
 #   sandbox allow [--name NAME] --url DOMAIN | --ip ADDR ...   # add egress entries LIVE (no restart)
 #   sandbox down [--name NAME]
 #   sandbox open [--name NAME]          # exec an interactive Claude Code session
@@ -101,6 +103,29 @@ else:
     sys.exit("sandbox: no free caido port in 8090-8389")
 ' "$used"
 }
+# Pick a stable host port for this sandbox's app forward (range 3000+), reusing its
+# own if already assigned. Mirrors assign_web_port/assign_caido_port so parallel
+# sandboxes never collide on host :3000 (the compose default). Maps host->container:3000.
+assign_app_port() {  # NAME -> echoes host port
+  local name="$1" used="" f
+  local ownfile="$DC/.broker-control-$name/app-port"
+  [ -f "$ownfile" ] && { cat "$ownfile"; return; }
+  for f in "$DC"/.broker-control-*/app-port; do [ -f "$f" ] && used="$used $(cat "$f")"; done
+  python3 -c '
+import socket, sys
+used = set(sys.argv[1].split())
+for p in range(3000, 3000 + 300):
+    if str(p) in used:
+        continue
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", p)); s.close(); print(p); break
+    except OSError:
+        s.close()
+else:
+    sys.exit("sandbox: no free app port in 3000-3299")
+' "$used"
+}
 
 # Populate the shared Claude home (idempotent). Symlinks target the CONTAINER path
 # (/home/node/dev/Minions) — dangling on the host, valid inside every sandbox.
@@ -182,8 +207,20 @@ MINIONS_DIR=$MINIONS_DIR
 ALLOW_INTERNET=$ALLOW_INTERNET
 ALLOWLIST_FILE=$ALLOWLIST_FILE
 EOF
-    [ -n "$PORT" ] && echo "FORWARD_SPEC=127.0.0.1:$PORT" >> "$DC/.env"
     mkdir -p "$DC/.broker-control-$NAME"
+
+    # App port forward: an explicit --port HOST:CTR is honoured verbatim; otherwise
+    # auto-assign a free host port (3000+, stable per sandbox) -> container :3000,
+    # mirroring the broker UI (9999+) and Caido (8090+) ranges so parallel sandboxes
+    # never collide on host :3000 (the compose default).
+    if [ -n "$PORT" ]; then
+      echo "FORWARD_SPEC=127.0.0.1:$PORT" >> "$DC/.env"
+      APP_PORT="${PORT%%:*}"; CTR_PORT="${PORT#*:}"
+    else
+      APP_PORT="$(assign_app_port "$NAME")"; CTR_PORT=3000
+      echo "$APP_PORT" > "$DC/.broker-control-$NAME/app-port"
+      echo "FORWARD_SPEC=127.0.0.1:$APP_PORT:3000" >> "$DC/.env"
+    fi
     [ "$ALLOW_INTERNET" = "1" ] && echo "sandbox: WARNING — --allow-internet: egress is UNRESTRICTED (no allowlist, no MITM)." >&2
 
     # Opt-in: loosen syscall confinement so rootless Podman/Buildah can build images.
@@ -239,6 +276,7 @@ EOF
     webui_start "$NAME" "$DC/.broker-control-$NAME" "$WEB_PORT"
     echo "sandbox: '$NAME' up. Open with:  ./sandbox open --name $NAME"
     echo "sandbox: broker UI at http://127.0.0.1:$WEB_PORT  (password via ./sandbox ls)"
+    echo "sandbox: app port  http://127.0.0.1:$APP_PORT -> container :$CTR_PORT"
     ;;
 
   ls)
@@ -256,6 +294,9 @@ EOF
       if [ -f "$ctrl/webui.pid" ] && kill -0 "$(cat "$ctrl/webui.pid")" 2>/dev/null; then status="running"; fi
       printf "  %-22s http://127.0.0.1:%-5s  password: %s  (%s)\n" \
         "$name" "$port" "$(cat "$ctrl/webui-password")" "$status"
+      # Secondary lines: app forward + Caido workbench, when assigned for this sandbox.
+      [ -f "$ctrl/app-port" ]   && printf "  %-22s app   -> http://127.0.0.1:%s (container :3000)\n" "" "$(cat "$ctrl/app-port")"
+      [ -f "$ctrl/caido-port" ] && printf "  %-22s caido -> http://127.0.0.1:%s\n" "" "$(cat "$ctrl/caido-port")"
     done
     [ "$found" = 0 ] && echo "  (none)"
     ;;
@@ -354,6 +395,6 @@ EOF
     ;;
 
   *)
-    sed -n '2,19p' "$0"
+    sed -n '2,22p' "$0"
     ;;
 esac
