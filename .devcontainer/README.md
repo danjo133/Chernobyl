@@ -60,6 +60,28 @@ no extra caps. The trade-offs (and the seccomp note) are deliberate:
   (`kernel.unprivileged_userns_clone=1` / NixOS `security.unprivilegedUsernsClone = true;`), else rootless
   builds fail to create the namespace.
 
+## Caches visible to the sandbox but not to git (`.sandboxshow`)
+
+The FUSE filter hides whatever `git check-ignore` would ignore, so build junk and
+git-ignored secrets never enter `/workspace`. But some git-ignored paths — caches you
+want the agent to read/write across runs — should stay visible. List them in a committed
+`.sandboxshow` at the repo root:
+
+```
+# .sandboxshow — git-ignored paths that stay read/write inside the sandbox
+.cache/
+.pytest_cache/
+tools/bin
+```
+
+Rules: blank lines and `#` comments are skipped; a trailing slash is optional. An entry
+**without** a slash matches that name as any path component (shell globs like `*.tmp`
+work); an entry **with** a slash matches that path and everything beneath it. The built-in
+set (`.claude`, `node_modules`, `.venv`, `target`, `dist`) is always force-shown. The
+**hard-deny secret layer** (`.env*`, `*.key`, `*.pem`, `id_*`, `.ssh`, `.aws`, `.gnupg`,
+`.kube`, `.docker`, …) ALWAYS wins — listing a secret here can never expose it. Writes to
+force-shown paths pass through to the host source dir (still git-ignored, so never committed).
+
 ## Two rules to remember
 
 - **A sandbox is a unit:** gateway + workload (+ any dev-dep containers) share one netns;

@@ -28,6 +28,7 @@ redis schema (populated out-of-band by the host-side filler — see broker/READM
 import json
 import logging
 import os
+import socket
 import time
 from fnmatch import fnmatch
 
@@ -105,6 +106,7 @@ class Broker:
         self.r = None
         self.rlog = RequestLog(REQUEST_LOG)
         self.caido = None       # (host, port) of the downstream Caido proxy, or None
+        self._dns_cache = {}    # sni -> (set(ip), expiry) for splice dst-IP verification
 
     # ---- lifecycle -------------------------------------------------------
     def running(self):
@@ -168,10 +170,53 @@ class Broker:
     def tls_clienthello(self, data):
         self._load()
         sni = data.client_hello.sni
-        if self._match(sni, self.passthrough):
+        if not self._match(sni, self.passthrough):
+            return  # non-passthrough hosts are decrypted; allow/deny in requestheaders
+        # SECURITY: splice ONLY if the real destination IP actually belongs to the SNI
+        # host. In transparent mode the workload controls BOTH the SNI and the original
+        # destination IP; matching on SNI alone would let it splice a raw TLS tunnel to an
+        # attacker's IP (arbitrary egress / C2) just by sending a spoofed SNI for an
+        # allowed passthrough host. Tie the two together: resolve the SNI and require the
+        # actual destination to be one of its addresses.
+        try:
+            dst_ip = data.context.server.address[0]
+        except Exception:  # noqa: BLE001 — unknown dst -> treat as mismatch, fail closed
+            dst_ip = None
+        if dst_ip and self._sni_matches_dst(sni, dst_ip):
             data.ignore_connection = True  # allowed, opaque
             self.rlog.record("SPLICE", "TLS", sni, "")
-        # Non-passthrough hosts are decrypted; allow/deny is enforced in requestheaders.
+        else:
+            # Fail closed: refuse to splice. mitmproxy then intercepts; a genuinely
+            # cert-pinned host rejects the MITM cert (connection dies) and any decrypted
+            # flow is DENIED in requestheaders (passthrough hosts are not in `inspect`).
+            # Either way no un-inspected bytes reach the spoofed destination.
+            log.warning("DENY splice: SNI/dst mismatch sni=%s dst=%s", sni, dst_ip)
+            self.rlog.record("DENY", "TLS", sni or "", "", reason="sni/dst mismatch")
+
+    _DNS_TTL = 30.0
+
+    def _sni_matches_dst(self, sni, dst_ip):
+        """True if dst_ip is one of the addresses the SNI host currently resolves to.
+
+        Cached briefly and unioned across recent lookups so CDN round-robin (different A
+        record than the workload got) doesn't spuriously deny a legitimate pinned host.
+        On resolve failure we keep the previous answer rather than failing legit traffic.
+        """
+        if not sni:
+            return False
+        now = time.time()
+        ips, exp = self._dns_cache.get(sni, (set(), 0.0))
+        if now >= exp:
+            fresh = set()
+            try:
+                for info in socket.getaddrinfo(sni, None):
+                    fresh.add(info[4][0])
+            except OSError as e:
+                log.warning("broker: DNS resolve failed for splice check %s: %s", sni, e)
+            if fresh:
+                ips = ips | fresh  # union to tolerate CDN rotation within the TTL window
+                self._dns_cache[sni] = (ips, now + self._DNS_TTL)
+        return dst_ip in ips
 
     # ---- HTTP: enforce allowlist, then inject ----------------------------
     def requestheaders(self, flow: http.HTTPFlow):
@@ -208,6 +253,15 @@ class Broker:
         method = flow.request.method
         path = flow.request.path
         handle = flow.request.headers.pop(HANDLE_HEADER, None)  # always strip; never forward upstream
+
+        # Credentials ride ONLY verified TLS. On cleartext HTTP the upstream is
+        # unauthenticated (no cert for mitmproxy to verify against the host), so injecting
+        # could hand the real secret to an attacker-controlled box reached via a spoofed
+        # Host header. Port 80 is already dropped at the firewall; this is defense in depth.
+        if flow.request.scheme != "https":
+            log.info("ALLOW %s %s%s (no inject: non-https)", method, host, path)
+            self.rlog.record("ALLOW", method, host, path, note="no-inject-non-https")
+            return
 
         headers = None
         if handle and self.r is not None:

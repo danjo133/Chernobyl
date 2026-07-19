@@ -22,8 +22,11 @@ githubusercontent.com
 
 # --- npm ---
 registry.npmjs.org
-# npm CDN is fronted by a pinned CDN; splice it rather than decrypt:
-!registry.npmjs.cf
+# npm installs work fully over the decrypted registry above. A '!' passthrough entry is
+# NOT shipped by default: splicing sends raw, un-inspected TLS to the destination, and the
+# gateway only permits it after verifying the destination IP resolves from the SNI host
+# (see broker_addon.tls_clienthello). Add one ONLY for a genuinely cert-pinned upstream you
+# trust, e.g.:  !registry.npmjs.cf
 
 # --- python ---
 pypi.org

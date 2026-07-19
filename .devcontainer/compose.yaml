@@ -79,7 +79,9 @@ services:
       - ${SANDBOX_CLAUDE_HOME:?set SANDBOX_CLAUDE_HOME (sandbox CLI sets this)}:/home/node/.claude
       # Minions toolkit, read-only, at the path settings.template.json expects
       # ($HOME/dev/Minions with $HOME=/home/node) so hook paths resolve verbatim.
-      - ${MINIONS_DIR:-/home/user/dev/Minions}:/home/node/dev/Minions:ro
+      # The `sandbox` CLI always writes MINIONS_DIR into .env; this default is only a
+      # fallback for a bare `docker compose` run. Point it at your Minions checkout.
+      - ${MINIONS_DIR:-/opt/minions}:/home/node/dev/Minions:ro
       # Build/dep dirs backed by per-sandbox volumes (see build-dirs.txt) — keeps host artifacts
       # out, survives rebuilds, isolates parallel sandboxes. Extend via the sandbox CLI.
       - build-node_modules:/workspace/node_modules

@@ -37,11 +37,21 @@ mkdir -p "$CONFDIR"
 chown -R "$PROXY_USER:$PROXY_USER" "$CONFDIR"
 
 # ---------------------------------------------------------------------------
-# IPv6: no egress at all (prevents bypassing the IPv4 filter over v6)
+# IPv6: no egress at all (prevents bypassing the IPv4 filter over v6).
+# Fail CLOSED: the IPv4 NAT/REDIRECT below is v4-only, so if we cannot install a
+# v6 DROP policy AND the container actually has global IPv6, the workload would get
+# unfiltered, un-MITM'd v6 egress. Refuse to start in that case (mirrors the
+# uid-collision tripwire) rather than silently running wide open. If there is no
+# global IPv6 at all, a missing ip6tables is harmless — warn and continue.
 # ---------------------------------------------------------------------------
-ip6tables -F 2>/dev/null || true
-ip6tables -P OUTPUT DROP 2>/dev/null || true
-ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
+if ip6tables -F 2>/dev/null && ip6tables -P OUTPUT DROP 2>/dev/null; then
+  ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
+elif ip -6 addr show scope global 2>/dev/null | grep -q "inet6"; then
+  echo "gateway: FATAL — ip6tables unavailable but the container has global IPv6; egress would bypass the filter over v6." >&2
+  exit 1
+else
+  echo "gateway: ip6tables unavailable and no global IPv6 present — continuing (no v6 egress path)." >&2
+fi
 
 # Always restore Docker's embedded-DNS hook first (both modes need working DNS).
 # Flush ONLY our own OUTPUT chain — never the whole nat table. `iptables -t nat -F`
@@ -69,7 +79,12 @@ else
   # ---------------------------------------------------------------------------
   iptables -t nat -A OUTPUT -m owner --uid-owner "$PROXY_UID" -j RETURN
   iptables -t nat -A OUTPUT -o lo -j RETURN
-  iptables -t nat -A OUTPUT -p tcp --dport 80  -j REDIRECT --to-ports "$MITM_PORT"
+  # HTTPS only. We deliberately do NOT redirect cleartext port 80: on HTTP the upstream
+  # is unauthenticated (mitmproxy has no cert to verify), so a workload that controls the
+  # original destination IP could point port 80 at an attacker box, send `Host: <allowed>`,
+  # and have the broker staple a real credential onto a request delivered IN CLEARTEXT to
+  # the attacker. Injecting only over verified TLS closes that confused-deputy exfil path.
+  # With no REDIRECT here, port-80 egress falls through to the OUTPUT DROP below (fails).
   iptables -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-ports "$MITM_PORT"
 
   # ---------------------------------------------------------------------------
@@ -86,10 +101,14 @@ else
   iptables -A OUTPUT -p tcp -d 127.0.0.1 --dport "$MITM_PORT" -j ACCEPT
   iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
   iptables -A OUTPUT -m owner --uid-owner "$PROXY_UID" -j ACCEPT
-  iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
-  iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
-  # (REDIRECT'd 80/443 packets now have a local destination -> matched by lo/ESTABLISHED.)
-  # TODO: optionally run dnsmasq here restricted to the allowlist for DNS-level defense in depth.
+  # DNS: allow ONLY Docker's embedded resolver (127.0.0.11, reached over lo and already
+  # accepted above). Do NOT allow port 53 to arbitrary resolvers — that is a high-bandwidth
+  # DNS-tunnel exfil/C2 channel (iodine/dnscat) straight past the allowlist. The embedded
+  # resolver forwards external lookups host-side, so no outbound 53 from this netns is needed
+  # for normal name resolution. These explicit rules are belt-and-braces over the `-o lo` rule.
+  iptables -A OUTPUT -p udp -d 127.0.0.11 --dport 53 -j ACCEPT
+  iptables -A OUTPUT -p tcp -d 127.0.0.11 --dport 53 -j ACCEPT
+  # (REDIRECT'd 443 packets now have a local destination -> matched by lo/ESTABLISHED.)
 fi
 
 # ---------------------------------------------------------------------------
