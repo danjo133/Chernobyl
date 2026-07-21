@@ -14,6 +14,9 @@
 #   sandbox allow [--name NAME] --url DOMAIN | --ip ADDR ...   # add egress entries LIVE (no restart)
 #   sandbox down [--name NAME]
 #   sandbox open [--name NAME]          # exec an interactive Claude Code session
+#   sandbox run  [--name NAME] [-d|--detach] [--stop] [--logs] [-- CMD...]
+#                                       # run a repo script inside the sandbox instead of Claude
+#                                       # (auto: sandbox-run.sh / run.sh / start.sh / npm dev|start)
 #   sandbox web  [--name NAME] [--port N] [--stop]   # (re)start/stop the host broker UI
 #   sandbox tools [--name NAME] [--unrestricted] [-- CMD...]   # shell into the hunter sidecar (or run CMD)
 #
@@ -394,7 +397,74 @@ EOF
       bash -lc 'claude --dangerously-skip-permissions'
     ;;
 
+  run)
+    # Run a project script inside the contained workload — turns the sandbox into a
+    # server/host runner instead of a Claude session. Command resolution (done INSIDE the
+    # container, against /workspace, so it always matches this sandbox regardless of which
+    # one .env last described): an explicit `-- CMD...` wins; otherwise auto-detect a repo
+    # entrypoint (./sandbox-run.sh, ./run.sh, ./start.sh, or package.json dev/start).
+    # Foreground by default (streams output, Ctrl-C stops); -d detaches it so it outlives
+    # your terminal — then `--logs` tails it and `--stop` kills it.
+    NAME=""; DETACH=0; STOP=0; LOGS=0; CMD=""
+    while [ $# -gt 0 ]; do case "$1" in
+      --name) NAME="$2"; shift 2;;
+      -d|--detach) DETACH=1; shift;;
+      --stop) STOP=1; shift;;
+      --logs) LOGS=1; shift;;
+      --) shift; CMD="$*"; break;;
+      -*) die "unknown arg $1";;
+      *) die "unexpected arg '$1' (pass a command after '--', e.g.  run --name NAME -- $*)";;
+    esac; done
+    [ -n "$NAME" ] || { [ -f "$DC/.env" ] && . "$DC/.env" && NAME="$SANDBOX_NAME"; }
+    [ -n "$NAME" ] || die "--name required (or run from a configured sandbox)"
+
+    # --stop / --logs act on a previously detached run; its pid/log live in the container.
+    if [ "$STOP" = 1 ]; then
+      COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" exec -T devcontainer bash -lc '
+        p=/tmp/sandbox-run.pid
+        [ -f "$p" ] || { echo "sandbox: no detached run recorded for this sandbox"; exit 0; }
+        pid=$(cat "$p")
+        if kill "$pid" 2>/dev/null; then echo "sandbox: stopped detached run (PID $pid)";
+        else echo "sandbox: detached run (PID $pid) was not running"; fi
+        rm -f "$p"'
+      exit 0
+    fi
+    if [ "$LOGS" = 1 ]; then
+      COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" exec devcontainer bash -lc '
+        [ -f /tmp/sandbox-run.log ] && exec tail -n +1 -f /tmp/sandbox-run.log
+        echo "sandbox: no detached run log yet (start one with:  ./sandbox run -d ...)"'
+      exit 0
+    fi
+
+    # Container-side resolver: $1 (if non-empty) is the explicit command, else auto-detect.
+    # Executable scripts run via their own shebang; non-executable ones via bash.
+    RESOLVE='cd /workspace || exit 1
+      if   [ -n "$1" ];               then cmd="$1"
+      elif [ -x ./sandbox-run.sh ];   then cmd="./sandbox-run.sh"
+      elif [ -f ./sandbox-run.sh ];   then cmd="bash sandbox-run.sh"
+      elif [ -x ./run.sh ];           then cmd="./run.sh"
+      elif [ -f ./run.sh ];           then cmd="bash run.sh"
+      elif [ -x ./start.sh ];         then cmd="./start.sh"
+      elif [ -f ./start.sh ];         then cmd="bash start.sh"
+      elif [ -f package.json ] && grep -Eq "\"dev\"[[:space:]]*:" package.json;   then cmd="npm run dev"
+      elif [ -f package.json ] && grep -Eq "\"start\"[[:space:]]*:" package.json; then cmd="npm start"
+      else echo "sandbox: no entrypoint found in /workspace — add ./sandbox-run.sh, ./run.sh or ./start.sh, or pass one after --  (e.g. run --name '"$NAME"' -- npm run dev)" >&2; exit 3
+      fi'
+
+    if [ "$DETACH" = 1 ]; then
+      COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" exec -T devcontainer bash -lc "$RESOLVE"'
+        nohup bash -lc "$cmd" >/tmp/sandbox-run.log 2>&1 &
+        echo $! >/tmp/sandbox-run.pid
+        echo "sandbox: detached run started -> $cmd  (PID $(cat /tmp/sandbox-run.pid))" >&2
+        echo "sandbox: tail it with  ./sandbox run --name '"$NAME"' --logs   |  stop with  --stop" >&2' _ "$CMD"
+    else
+      COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" exec devcontainer bash -lc "$RESOLVE"'
+        echo "sandbox: running in '"'$NAME'"' -> $cmd  (Ctrl-C to stop)" >&2
+        exec bash -lc "$cmd"' _ "$CMD"
+    fi
+    ;;
+
   *)
-    sed -n '2,22p' "$0"
+    sed -n '2,25p' "$0"
     ;;
 esac
