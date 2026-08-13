@@ -16,6 +16,12 @@ ${BROKER_CONTROL_DIR:-./.broker-control}  (host)  ->  /run/broker-control  (gate
 
 `fill.py` runs on the host and writes credential records that the gateway reads.
 
+> **Also here (different job):** `flywheel.py` reads the LLM traffic the gateway captures
+> under `sandbox up --flywheel` — `stats` / `tail` / `export` over
+> `.broker-control-<name>/flywheel/`. It touches no credentials and no redis; it is in this
+> directory because it is the other host-side reader of a control dir. See plan §18 and the
+> unredacted-content warning in `SECURITY.md`.
+
 > **Two front-ends, same store:**
 > - **`webui.py`** — host-only, password-gated web app (see `docs/SANDBOX-PLAN.md` §15).
 >   Launched by `./sandbox up`; URL + password shown by `./sandbox ls`. Set inject-by-host

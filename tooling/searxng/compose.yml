@@ -1,0 +1,54 @@
+# SearXNG for agent sandboxes — run this on your LAN/server box, NOT inside a sandbox.
+#
+# Why not a sandbox sidecar: a sidecar shares the gateway's network namespace, so
+# SearXNG's own upstream traffic (google, duckduckgo, startpage, …) would have to be
+# allowlisted and MITM'd — a wide hole in the boundary the sandbox exists to defend, and
+# exactly the traffic pattern that trips bot detection. Run it once here instead: the
+# sandbox then allowlists ONE hostname and every sandbox shares the instance.
+# See docs/SANDBOX-PLAN.md §19 and ./README.md.
+#
+#   cp .env.example .env && edit it     # SEARXNG_SECRET, SEARXNG_BASE_URL
+#   docker compose up -d
+#   curl "http://127.0.0.1:8888/search?q=test&format=json" | head
+#
+# Then point sandboxes at it:  ./sandbox up --source ... --search-url https://searxng.example.com
+
+name: searxng
+
+services:
+  searxng:
+    image: docker.io/searxng/searxng:latest
+    restart: unless-stopped
+    ports:
+      # Host-local only. Put your existing reverse proxy (TLS + auth) in front of this —
+      # do NOT publish it to the internet unauthenticated.
+      - "127.0.0.1:${SEARXNG_PORT:-8888}:8080"
+    volumes:
+      - ./settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      # The image substitutes this into settings.yml's `ultrasecretkey` placeholder.
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?set SEARXNG_SECRET in .env (openssl rand -hex 32)}
+      SEARXNG_BASE_URL: ${SEARXNG_BASE_URL:-http://localhost:8888/}
+      SEARXNG_REDIS_URL: valkey://valkey:6379/0
+    depends_on:
+      - valkey
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID]
+    logging:
+      driver: json-file
+      options: { max-size: "1m", max-file: "1" }
+
+  valkey:
+    image: docker.io/valkey/valkey:8-alpine
+    restart: unless-stopped
+    command: valkey-server --save "" --appendonly no
+    volumes:
+      - valkey-data:/data
+    cap_drop: [ALL]
+    cap_add: [SETGID, SETUID, DAC_OVERRIDE]
+    logging:
+      driver: json-file
+      options: { max-size: "1m", max-file: "1" }
+
+volumes:
+  valkey-data:

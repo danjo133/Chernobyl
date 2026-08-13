@@ -1,8 +1,15 @@
-# Workload image — Claude Code + toolchain. See docs/SANDBOX-PLAN.md §3.2.
+# Workload image — agent harnesses + toolchain. See docs/SANDBOX-PLAN.md §3.2, §17.
 # UNVERIFIED scaffold.
-FROM mcr.microsoft.com/devcontainers/javascript-node:20
+FROM mcr.microsoft.com/devcontainers/javascript-node:22
 
+# Harness versions. All four are baked in (one cache layer each) so switching
+# `--harness` at runtime never triggers a rebuild and never needs egress.
 ARG CLAUDE_CODE_VERSION=latest
+ARG PI_VERSION=latest
+ARG OMP_VERSION=latest
+# omp's binary is a bun bundle — the harness installs bun alongside it.
+ARG BUN_VERSION=latest
+ARG PRIME_AGENT_VERSION=0.7.2
 # Bump as needed. GOTOOLCHAIN=local (below) pins builds to exactly this version.
 ARG GO_VERSION=1.23.4
 
@@ -37,10 +44,25 @@ RUN arch="$(dpkg --print-architecture)" \
 # permits the unshare(CLONE_NEWUSER) that rootless builds require. Config below.
 COPY containers/storage.conf containers/containers.conf containers/registries.conf /etc/containers/
 
-# Pin Claude Code for reproducibility; auto-update is disabled via env below.
-RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+# --- Agent harnesses -----------------------------------------------------------
+# The harness registry drives install, per-harness config and launch; the same files
+# are read by the `sandbox` CLI on the host. See .devcontainer/harness/lib.sh.
+COPY harness/ /usr/local/lib/sandbox-harness/
+# `websearch` is one search command for every harness: omp has a native web_search tool,
+# but pi and prime-agent ship none and Claude Code's is server-side (so it disappears
+# with a local model). See docs/SANDBOX-PLAN.md §19.
+RUN chmod +x /usr/local/lib/sandbox-harness/*.sh /usr/local/lib/sandbox-harness/websearch \
+ && ln -sf /usr/local/lib/sandbox-harness/run.sh /usr/local/bin/sandbox-harness \
+ && ln -sf /usr/local/lib/sandbox-harness/websearch /usr/local/bin/websearch
 
-# Organization policy (highest-precedence settings). See managed-settings.json.
+# One RUN each: an unrelated version bump only invalidates that harness's layer.
+RUN /usr/local/lib/sandbox-harness/install.sh claudecode
+RUN /usr/local/lib/sandbox-harness/install.sh pi
+RUN /usr/local/lib/sandbox-harness/install.sh omp
+RUN /usr/local/lib/sandbox-harness/install.sh prime-agent
+
+# Organization policy for Claude Code (highest-precedence settings). Other harnesses
+# have no equivalent — the container is their boundary. See managed-settings.json.
 RUN mkdir -p /etc/claude-code
 COPY managed-settings.json /etc/claude-code/managed-settings.json
 
@@ -69,11 +91,12 @@ ENV PATH=/usr/local/go/bin:/home/node/go/bin:/home/node/dev/Minions/tools/bin:${
 # into a FRESH named volume on first mount, so node owns its config + build dirs
 # without an init step or CAP_CHOWN. (Caveat: only applies to brand-new volumes — an
 # already-root-owned volume from a prior run must be removed or chowned once.)
-RUN mkdir -p /home/node/.claude \
+RUN mkdir -p /home/node/.claude /home/node/.pi /home/node/.omp /home/node/.prime \
              /workspace/node_modules /workspace/.venv /workspace/target /workspace/dist \
              /home/node/go /home/node/.local/share/containers \
- && chown -R node:node /home/node/.claude /workspace /home/node/go /home/node/.local \
- && chmod 700 /home/node/.claude
+ && chown -R node:node /home/node/.claude /home/node/.pi /home/node/.omp /home/node/.prime \
+                      /workspace /home/node/go /home/node/.local \
+ && chmod 700 /home/node/.claude /home/node/.pi /home/node/.omp /home/node/.prime
 
 # TODO: to keep the IDE backend off the egress allowlist, pre-bake it here
 #       (vscode-server / JetBrains backend). See docs/SANDBOX-PLAN.md §13.

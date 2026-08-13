@@ -1,28 +1,41 @@
 #!/usr/bin/env bash
-# sandbox — manage Claude Code sandboxes. See docs/SANDBOX-PLAN.md.
+# sandbox — manage agent sandboxes. See docs/SANDBOX-PLAN.md.
 #
 #   sandbox up   --source PATH [--name NAME] [--worktree BRANCH]
+#                [--harness claudecode|pi|omp|prime-agent]      agent CLI to run (default: claudecode)
+#                [--llm-backend anthropic|ollama|openai-compat] where tokens come from (default: anthropic)
+#                [--llm-url URL]           backend endpoint (default: the backend's own)
+#                [--model ID]              model id (local backends: auto-picked if omitted)
+#                [--small-model ID]        model for the fast/subagent slot
+#                [--search-url URL]        web search endpoint (SearXNG JSON API) for every
+#                                          harness; `--search none` turns it off
+#                [--flywheel]              record every LLM call for later distillation / eval
 #                [--port HOST:CTR]         publish an app port (default: auto-assign a free
 #                                          host port from 3000 up -> container :3000)
-#                [--tools]                 add the bb-hunter tools sidecar (Claude drives it over SSH)
+#                [--tools]                 add the bb-hunter tools sidecar (the agent drives it over SSH)
 #                [--web-port N]            host-only broker UI port (default: first free from 9999)
 #                [--allow-url DOMAIN]...   add domain(s) to the egress allowlist
 #                [--allow-ip IP]...        add IP(s) to the egress allowlist
 #                [--allow-internet]        UNRESTRICTED egress (no allowlist, no MITM)
 #                [--allow-image-build]     seccomp=unconfined, so rootless podman/buildah can build images
-#   sandbox ls                          # sandboxes + broker UI / app / caido ports + password
+#   sandbox ls                          # sandboxes + harness/backend + broker UI / app / caido ports
 #   sandbox allow [--name NAME] --url DOMAIN | --ip ADDR ...   # add egress entries LIVE (no restart)
 #   sandbox down [--name NAME]
-#   sandbox open [--name NAME]          # exec an interactive Claude Code session
+#   sandbox open [--name NAME] [--harness H] [--llm-backend B] [--model ID] [-- ARGS...]
+#                                       # interactive agent session (asks which harness if unset)
+#   sandbox models [--llm-backend B] [--llm-url URL]    # what the backend serves
+#   sandbox flywheel [--name NAME] stats|tail|export [ARGS...]   # the captured LLM traffic
 #   sandbox run  [--name NAME] [-d|--detach] [--stop] [--logs] [-- CMD...]
-#                                       # run a repo script inside the sandbox instead of Claude
+#                                       # run a repo script inside the sandbox instead of the agent
 #                                       # (auto: sandbox-run.sh / run.sh / start.sh / npm dev|start)
 #   sandbox web  [--name NAME] [--port N] [--stop]   # (re)start/stop the host broker UI
 #   sandbox tools [--name NAME] [--unrestricted] [-- CMD...]   # shell into the hunter sidecar (or run CMD)
 #
 # Each sandbox is a compose project (COMPOSE_PROJECT_NAME) -> isolated networks/volumes.
 # Parallel sandboxes = different --name (and ideally different --worktree of a repo).
-# Auth/agents come from a shared host-side Claude home (SANDBOX_CLAUDE_HOME); log in once.
+# Every harness gets its own shared host-side home (SANDBOX_HOMES), so you log in once
+# per harness and every sandbox inherits it. Defaults can also come from the environment:
+# SANDBOX_HARNESS, SANDBOX_LLM_BACKEND, SANDBOX_LLM_URL, SANDBOX_MODEL.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,13 +44,44 @@ COMPOSE=(docker compose -f "$DC/compose.yaml")
 WEBUI_PY="$HERE/broker/webui.py"
 WEB_PORT_DEFAULT=9999
 
-# Shared, per-user (NOT per-sandbox) Claude home: auth + settings + agents/skills +
+# Shared, per-user (NOT per-sandbox) harness homes: auth + settings + agents/skills +
 # session logs, bind-mounted into every sandbox. Login once; every sandbox inherits it.
+# Claude Code keeps its historical path so existing logins survive the harness split.
+SANDBOX_HOMES="${SANDBOX_HOMES:-$HOME/.sandbox/homes}"
+# Web search endpoint (SearXNG JSON API) used by every harness — deploy it OUTSIDE the
+# sandbox (tooling/searxng/), so only this one host lands on the egress allowlist.
+# Defaults to the local compose deployment; export SANDBOX_SEARCH_URL for a box on your
+# network, or pass --search-url per sandbox.
+SEARCH_URL_DEFAULT="${SANDBOX_SEARCH_URL:-http://localhost:8888}"
 SANDBOX_CLAUDE_HOME="${SANDBOX_CLAUDE_HOME:-$HOME/.sandbox/claude-home}"
 # Minions toolkit repo on the host (bound read-only into each sandbox).
 MINIONS_DIR="${MINIONS_DIR:-$HOME/dev/Minions}"
 
 die() { echo "sandbox: $*" >&2; exit 1; }
+
+# Harness/backend registry — the same files the workload image uses, so the CLI and the
+# container can never disagree about what a harness is called or what it needs. See §17.
+HARNESS_LIB_DIR="$DC/harness"
+# shellcheck source=.devcontainer/harness/lib.sh
+. "$HARNESS_LIB_DIR/lib.sh"
+
+# --- per-sandbox state (harness selection etc.) ------------------------------
+# Kept in the sandbox's own control dir rather than .devcontainer/.env, which is
+# last-writer-wins across parallel sandboxes.
+state_dir() { echo "$DC/.broker-control-$1"; }
+state_set() { mkdir -p "$(state_dir "$1")"; printf '%s\n' "$3" > "$(state_dir "$1")/$2"; }
+state_get() { local f; f="$(state_dir "$1")/$2"; [ -f "$f" ] && cat "$f" || true; }
+
+# Every harness's shared host home, exported for EVERY compose invocation — compose.yaml
+# requires all of them. Doing it here rather than only writing them into .env at `up` is
+# what lets `down`/`open` still work on a sandbox created before harnesses existed (its
+# .env has no SANDBOX_*_HOME lines, and compose would refuse to run at all).
+for _h in $HARNESS_LIST; do
+  harness_load "$_h"
+  if [ "$H_NAME" = claudecode ]; then _p="$SANDBOX_CLAUDE_HOME"; else _p="$SANDBOX_HOMES/$H_HOST_HOME"; fi
+  export "$H_HOME_ENV=$_p"
+done
+unset _h _p
 
 # --- host-side credential/log web UI (one per sandbox) ----------------------
 # Runs on the host (127.0.0.1 only), gated by a per-sandbox password, talking to
@@ -147,18 +191,70 @@ setup_claude_home() {
   fi
 }
 
+# Create every harness's shared host home and emit the compose bindings for them.
+# Data-driven from the harness registry: compose mounts all of them, so switching
+# harness later never requires recreating the container.
+harness_home_env_lines() {
+  local h p
+  for h in $HARNESS_LIST; do
+    ( harness_load "$h"
+      p="${!H_HOME_ENV}"        # exported at startup, above
+      mkdir -p "$p"
+      echo "$H_HOME_ENV=$p" )
+  done
+}
+
+# Ask which harness to use, listing what is actually installed in this sandbox's image.
+# stdout is the answer, so the menu goes to stderr and the reply is read from the tty.
+pick_harness() {  # NAME -> echoes harness
+  local name="$1" list i=0 names=() choice hname _bin ver desc
+  list="$(COMPOSE_PROJECT_NAME="$name" "${COMPOSE[@]}" exec -T devcontainer sandbox-harness list 2>/dev/null || true)"
+  [ -n "$list" ] || { echo "$HARNESS_DEFAULT"; return; }
+  echo "sandbox: which harness?" >&2
+  while IFS=$'\t' read -r hname _bin ver desc; do
+    [ -n "$hname" ] || continue
+    i=$((i + 1)); names+=("$hname")
+    printf '  %d) %-12s %-10s %s\n' "$i" "$hname" "$ver" "$desc" >&2
+  done <<< "$list"
+  printf 'sandbox: [1-%d, default 1] ' "$i" >&2
+  read -r choice < /dev/tty || choice=""
+  case "$choice" in
+    ''|*[!0-9]*) choice=1 ;;
+  esac
+  [ "$choice" -ge 1 ] && [ "$choice" -le "$i" ] || choice=1
+  echo "${names[$((choice - 1))]}"
+}
+
 cmd="${1:-help}"; shift || true
 
 case "$cmd" in
   up)
     SOURCE=""; NAME=""; WORKTREE=""; PORT=""; ALLOW_INTERNET=0; ALLOW_EXTRA=""; ALLOW_IMAGE_BUILD=0; TOOLS=0
     WEB_PORT=""   # empty -> auto-assign a free port per sandbox (below)
+    HARNESS="${SANDBOX_HARNESS:-claudecode}"; BACKEND="${SANDBOX_LLM_BACKEND:-anthropic}"
+    LLM_URL="${SANDBOX_LLM_URL:-}"; MODEL="${SANDBOX_MODEL:-}"; SMALL_MODEL="${SANDBOX_SMALL_MODEL:-}"
+    FLYWHEEL=0; LLM_ANTHROPIC="${SANDBOX_LLM_ANTHROPIC:-0}"
+    SEARCH_URL="${SANDBOX_SEARCH_URL:-}"
     while [ $# -gt 0 ]; do case "$1" in
       --source) SOURCE="$2"; shift 2;;
       --name) NAME="$2"; shift 2;;
       --worktree) WORKTREE="$2"; shift 2;;
       --port) PORT="$2"; shift 2;;
       --web-port) WEB_PORT="$2"; shift 2;;
+      --harness) HARNESS="$2"; shift 2;;
+      --llm-backend|--backend) BACKEND="$2"; shift 2;;
+      --llm-url) LLM_URL="$2"; shift 2;;
+      --model) MODEL="$2"; shift 2;;
+      --small-model) SMALL_MODEL="$2"; shift 2;;
+      --llm-anthropic-compat) LLM_ANTHROPIC=1; shift;;
+      --search-url) SEARCH_URL="$2"; shift 2;;
+      # `--search searxng` is sugar for the default endpoint; `--search none` disables.
+      --search) case "$2" in
+                  none|off) SEARCH_URL="" ;;
+                  searxng)  SEARCH_URL="${SEARCH_URL:-$SEARCH_URL_DEFAULT}" ;;
+                  *) die "unknown --search '$2' (searxng|none — use --search-url for the endpoint)" ;;
+                esac; shift 2;;
+      --flywheel) FLYWHEEL=1; shift;;
       --tools) TOOLS=1; shift;;
       --allow-internet) ALLOW_INTERNET=1; shift;;
       --allow-url) ALLOW_EXTRA="$ALLOW_EXTRA $2"; shift 2;;
@@ -168,6 +264,37 @@ case "$cmd" in
     esac; done
     [ -n "$SOURCE" ] || die "--source is required"
     SOURCE="$(cd "$SOURCE" && pwd)"
+
+    # Resolve harness + backend up front: both contribute egress allowlist entries, and
+    # a typo here should fail before anything is built.
+    harness_known "$HARNESS" || die "unknown --harness '$HARNESS' (known: $HARNESS_LIST)"
+    backend_known "$BACKEND" || die "unknown --llm-backend '$BACKEND' (known: $BACKEND_LIST)"
+    export SANDBOX_LLM_URL="$LLM_URL" SANDBOX_LLM_ANTHROPIC="$LLM_ANTHROPIC"
+    harness_load "$HARNESS"
+    backend_load "$BACKEND"
+    # A local backend needs a concrete model id — nothing sensible to fall back on.
+    # Ask the backend itself rather than hardcoding a list that rots.
+    if [ "$BACKEND" != anthropic ] && [ -z "$MODEL" ]; then
+      MODEL="$(python3 "$HARNESS_LIB_DIR/probe_models.py" "$B_URL" --pick)" \
+        || die "could not pick a model from $B_URL — pass --model (see: ./sandbox models --llm-backend $BACKEND)"
+      echo "sandbox: no --model given; picked '$MODEL' (largest tool-capable model at $B_URL)"
+    fi
+    if [ "$BACKEND" != anthropic ] && [ -z "$SMALL_MODEL" ]; then
+      SMALL_MODEL="$(python3 "$HARNESS_LIB_DIR/probe_models.py" "$B_URL" --pick-small 2>/dev/null || true)"
+    fi
+    # Ask the backend for each model's real context window — every harness otherwise
+    # assumes its own default for an unknown model and mis-sizes the session.
+    MODEL_CONTEXT=""; SMALL_MODEL_CONTEXT=""
+    if [ "$BACKEND" != anthropic ]; then
+      [ -z "$MODEL" ] || MODEL_CONTEXT="$(python3 "$HARNESS_LIB_DIR/probe_models.py" "$B_URL" --context "$MODEL" 2>/dev/null || true)"
+      [ -z "$SMALL_MODEL" ] || SMALL_MODEL_CONTEXT="$(python3 "$HARNESS_LIB_DIR/probe_models.py" "$B_URL" --context "$SMALL_MODEL" 2>/dev/null || true)"
+    fi
+    # The harness's own endpoints + the backend's host have to be reachable, or the
+    # sandbox comes up unable to talk to a model at all.
+    ALLOW_EXTRA="$ALLOW_EXTRA $H_DOMAINS $B_DOMAINS"
+    # Search is one allowlist entry — the search host does the engine-scraping outside
+    # this containment (that is the whole reason it is not a sidecar). See §19.
+    [ -z "$SEARCH_URL" ] || ALLOW_EXTRA="$ALLOW_EXTRA $(url_host "$SEARCH_URL")"
 
     # Same repo, multiple tasks -> isolate via git worktree.
     if [ -n "$WORKTREE" ]; then
@@ -205,12 +332,25 @@ SANDBOX_SOURCE=$SOURCE
 SANDBOX_MOUNT=$MOUNT
 CLAUDE_CODE_VERSION=${CLAUDE_CODE_VERSION:-latest}
 BROKER_CONTROL_DIR=$DC/.broker-control-$NAME
-SANDBOX_CLAUDE_HOME=$SANDBOX_CLAUDE_HOME
 MINIONS_DIR=$MINIONS_DIR
 ALLOW_INTERNET=$ALLOW_INTERNET
 ALLOWLIST_FILE=$ALLOWLIST_FILE
+FLYWHEEL=$FLYWHEEL
 EOF
+    harness_home_env_lines >> "$DC/.env"   # SANDBOX_CLAUDE_HOME / _PI_ / _OMP_ / _PRIME_HOME
     mkdir -p "$DC/.broker-control-$NAME"
+
+    # Remember the selection for this sandbox: `open` reuses it, `ls` displays it.
+    state_set "$NAME" harness "$HARNESS"
+    state_set "$NAME" llm-backend "$BACKEND"
+    state_set "$NAME" llm-url "$LLM_URL"
+    state_set "$NAME" model "$MODEL"
+    state_set "$NAME" small-model "$SMALL_MODEL"
+    state_set "$NAME" model-context "$MODEL_CONTEXT"
+    state_set "$NAME" small-model-context "$SMALL_MODEL_CONTEXT"
+    state_set "$NAME" llm-anthropic "$LLM_ANTHROPIC"
+    state_set "$NAME" search-url "$SEARCH_URL"
+    state_set "$NAME" flywheel "$FLYWHEEL"
 
     # App port forward: an explicit --port HOST:CTR is honoured verbatim; otherwise
     # auto-assign a free host port (3000+, stable per sandbox) -> container :3000,
@@ -278,8 +418,20 @@ EOF
     [ -n "$WEB_PORT" ] || WEB_PORT="$(assign_web_port "$NAME")"
     webui_start "$NAME" "$DC/.broker-control-$NAME" "$WEB_PORT"
     echo "sandbox: '$NAME' up. Open with:  ./sandbox open --name $NAME"
+    echo "sandbox: harness   $HARNESS -> $BACKEND${MODEL:+ ($MODEL)}  [$B_URL]"
+    if [ -n "$SEARCH_URL" ]; then
+      echo "sandbox: search    $SEARCH_URL  ('websearch' in-container; omp uses it natively)"
+    fi
     echo "sandbox: broker UI at http://127.0.0.1:$WEB_PORT  (password via ./sandbox ls)"
     echo "sandbox: app port  http://127.0.0.1:$APP_PORT -> container :$CTR_PORT"
+    if [ "$FLYWHEEL" = 1 ]; then
+      echo "sandbox: flywheel ON — every LLM call is recorded UNREDACTED (prompts, code, tool output)"
+      echo "sandbox:            to $DC/.broker-control-$NAME/flywheel/ ; read it with ./sandbox flywheel --name $NAME stats"
+    fi
+    if [ "$HARNESS" != claudecode ] && [ "$BACKEND" = anthropic ]; then
+      echo "sandbox: NOTE — $HARNESS + anthropic expects the real key to come from the broker" >&2
+      echo "sandbox:        (set it for api.anthropic.com in the broker UI) or from '/login' inside the sandbox." >&2
+    fi
     ;;
 
   ls)
@@ -297,6 +449,14 @@ EOF
       if [ -f "$ctrl/webui.pid" ] && kill -0 "$(cat "$ctrl/webui.pid")" 2>/dev/null; then status="running"; fi
       printf "  %-22s http://127.0.0.1:%-5s  password: %s  (%s)\n" \
         "$name" "$port" "$(cat "$ctrl/webui-password")" "$status"
+      # What this sandbox is actually running, if it was brought up with a harness.
+      if [ -f "$ctrl/harness" ]; then
+        printf "  %-22s agent -> %s via %s%s%s\n" "" \
+          "$(cat "$ctrl/harness")" "$(cat "$ctrl/llm-backend" 2>/dev/null || echo anthropic)" \
+          "$( [ -s "$ctrl/model" ] && printf ' (%s)' "$(cat "$ctrl/model")" )" \
+          "$( [ "$(cat "$ctrl/flywheel" 2>/dev/null)" = 1 ] && printf '  [flywheel]' )"
+        [ -s "$ctrl/search-url" ] && printf "  %-22s search -> %s\n" "" "$(cat "$ctrl/search-url")"
+      fi
       # Secondary lines: app forward + Caido workbench, when assigned for this sandbox.
       [ -f "$ctrl/app-port" ]   && printf "  %-22s app   -> http://127.0.0.1:%s (container :3000)\n" "" "$(cat "$ctrl/app-port")"
       [ -f "$ctrl/caido-port" ] && printf "  %-22s caido -> http://127.0.0.1:%s\n" "" "$(cat "$ctrl/caido-port")"
@@ -389,12 +549,149 @@ EOF
     ;;
 
   open)
-    NAME=""
-    while [ $# -gt 0 ]; do case "$1" in --name) NAME="$2"; shift 2;; *) die "unknown arg $1";; esac; done
+    # Launch the agent. The harness/backend/model are resolved HERE (not baked into the
+    # container at `up`), and passed in per exec — so switching harness or model is just
+    # another `open`, with no restart and no lost broker credentials.
+    NAME=""; HARNESS=""; BACKEND=""; LLM_URL=""; MODEL=""; SMALL_MODEL=""; SEARCH_URL=""; SEARCH_SET=0
+    while [ $# -gt 0 ]; do case "$1" in
+      --name) NAME="$2"; shift 2;;
+      --harness) HARNESS="$2"; shift 2;;
+      --llm-backend|--backend) BACKEND="$2"; shift 2;;
+      --llm-url) LLM_URL="$2"; shift 2;;
+      --model) MODEL="$2"; shift 2;;
+      --small-model) SMALL_MODEL="$2"; shift 2;;
+      --search-url) SEARCH_URL="$2"; SEARCH_SET=1; shift 2;;
+      --search) SEARCH_SET=1
+                case "$2" in
+                  none|off) SEARCH_URL="" ;;
+                  searxng)  SEARCH_URL="$SEARCH_URL_DEFAULT" ;;
+                  *) die "unknown --search '$2' (searxng|none)" ;;
+                esac; shift 2;;
+      --) shift; break;;
+      -*) die "unknown arg $1";;
+      *) break;;
+    esac; done
     [ -n "$NAME" ] || { [ -f "$DC/.env" ] && . "$DC/.env" && NAME="$SANDBOX_NAME"; }
     [ -n "$NAME" ] || die "--name required"
-    COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" exec devcontainer \
-      bash -lc 'claude --dangerously-skip-permissions'
+
+    # Precedence: flag > what this sandbox last used > environment default > ask.
+    [ -n "$HARNESS" ] || HARNESS="$(state_get "$NAME" harness)"
+    [ -n "$HARNESS" ] || HARNESS="${SANDBOX_HARNESS:-}"
+    if [ -z "$HARNESS" ]; then
+      if [ -t 0 ] && [ -t 2 ]; then HARNESS="$(pick_harness "$NAME")"; else HARNESS=claudecode; fi
+    fi
+    harness_known "$HARNESS" || die "unknown --harness '$HARNESS' (known: $HARNESS_LIST)"
+    [ -n "$BACKEND" ] || BACKEND="$(state_get "$NAME" llm-backend)"
+    [ -n "$BACKEND" ] || BACKEND="${SANDBOX_LLM_BACKEND:-anthropic}"
+    backend_known "$BACKEND" || die "unknown --llm-backend '$BACKEND' (known: $BACKEND_LIST)"
+    [ -n "$LLM_URL" ]     || LLM_URL="$(state_get "$NAME" llm-url)"
+    [ -n "$MODEL" ]       || MODEL="$(state_get "$NAME" model)"
+    [ -n "$SMALL_MODEL" ] || SMALL_MODEL="$(state_get "$NAME" small-model)"
+    # `--search none` must be able to clear a recorded endpoint, so an explicit flag wins
+    # even when it is empty — hence SEARCH_SET rather than a non-empty test.
+    [ "$SEARCH_SET" = 1 ] || SEARCH_URL="$(state_get "$NAME" search-url)"
+
+    export SANDBOX_LLM_URL="$LLM_URL" SANDBOX_LLM_ANTHROPIC="$(state_get "$NAME" llm-anthropic)"
+    harness_load "$HARNESS"
+    backend_load "$BACKEND"
+
+    # Switching harness or backend usually needs egress this sandbox was not brought up
+    # with. The allowlist is hot-reloaded, so adding to it here is enough — no restart,
+    # and the broker keeps whatever credentials you set.
+    AF="$DC/.allowlist-$NAME.txt"
+    SEARCH_DOMAIN=""
+    [ -z "$SEARCH_URL" ] || SEARCH_DOMAIN="$(url_host "$SEARCH_URL")"
+    if [ -f "$AF" ]; then
+      for h in $H_DOMAINS $B_DOMAINS $SEARCH_DOMAIN; do
+        if ! grep -qxF "$h" "$AF"; then echo "$h" >> "$AF"; echo "sandbox: + allowed $h"; fi
+      done
+    fi
+
+    # Context windows track the model, so re-probe when one was given on the command
+    # line; fall back to whatever `up` recorded if the backend is unreachable from here.
+    MODEL_CONTEXT="$(state_get "$NAME" model-context)"
+    SMALL_MODEL_CONTEXT="$(state_get "$NAME" small-model-context)"
+    if [ "$BACKEND" != anthropic ] && [ -n "$MODEL" ]; then
+      probed="$(python3 "$HARNESS_LIB_DIR/probe_models.py" "$B_URL" --context "$MODEL" 2>/dev/null || true)"
+      if [ -n "$probed" ]; then MODEL_CONTEXT="$probed"; fi
+      if [ -n "$SMALL_MODEL" ]; then
+        probed="$(python3 "$HARNESS_LIB_DIR/probe_models.py" "$B_URL" --context "$SMALL_MODEL" 2>/dev/null || true)"
+        if [ -n "$probed" ]; then SMALL_MODEL_CONTEXT="$probed"; fi
+      fi
+    fi
+    state_set "$NAME" model-context "$MODEL_CONTEXT"
+    state_set "$NAME" small-model-context "$SMALL_MODEL_CONTEXT"
+
+    state_set "$NAME" harness "$HARNESS"
+    state_set "$NAME" llm-backend "$BACKEND"
+    state_set "$NAME" llm-url "$LLM_URL"
+    state_set "$NAME" model "$MODEL"
+    state_set "$NAME" small-model "$SMALL_MODEL"
+    state_set "$NAME" search-url "$SEARCH_URL"
+
+    # Containers created before the harness registry existed have no sandbox-harness.
+    # Fall back to the old behaviour rather than failing an `open` on a live sandbox.
+    if ! COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" exec -T devcontainer \
+         bash -lc 'command -v sandbox-harness' >/dev/null 2>&1; then
+      echo "sandbox: this container predates the harness registry — opening Claude Code." >&2
+      echo "sandbox: re-run './sandbox up --source ...' to rebuild it with all harnesses." >&2
+      COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" exec devcontainer \
+        bash -lc 'claude --dangerously-skip-permissions'
+      exit $?
+    fi
+
+    # Via a login shell so the harness binaries on the npm-global PATH resolve, exactly
+    # as the previous `bash -lc 'claude …'` did.
+    COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" exec \
+      -e "SANDBOX_HARNESS=$HARNESS" \
+      -e "SANDBOX_LLM_BACKEND=$BACKEND" \
+      -e "SANDBOX_LLM_URL=$LLM_URL" \
+      -e "SANDBOX_MODEL=$MODEL" \
+      -e "SANDBOX_SMALL_MODEL=$SMALL_MODEL" \
+      -e "SANDBOX_MODEL_CONTEXT=$MODEL_CONTEXT" \
+      -e "SANDBOX_SMALL_MODEL_CONTEXT=$SMALL_MODEL_CONTEXT" \
+      -e "SANDBOX_LLM_ANTHROPIC=${SANDBOX_LLM_ANTHROPIC:-0}" \
+      -e "SANDBOX_SEARCH_URL=$SEARCH_URL" \
+      devcontainer bash -lc 'exec sandbox-harness exec -- "$@"' _ "$@"
+    ;;
+
+  models)
+    # What can this backend actually run? Tool-capable models first — a harness is
+    # useless against a model that cannot call tools.
+    BACKEND="${SANDBOX_LLM_BACKEND:-ollama}"; LLM_URL="${SANDBOX_LLM_URL:-}"; NAME=""
+    while [ $# -gt 0 ]; do case "$1" in
+      --llm-backend|--backend) BACKEND="$2"; shift 2;;
+      --llm-url) LLM_URL="$2"; shift 2;;
+      --name) NAME="$2"; shift 2;;
+      *) die "unknown arg $1";;
+    esac; done
+    if [ -n "$NAME" ]; then           # inspect what a specific sandbox is pointed at
+      BACKEND="$(state_get "$NAME" llm-backend)"; LLM_URL="$(state_get "$NAME" llm-url)"
+      [ -n "$BACKEND" ] || die "no recorded backend for '$NAME'"
+    fi
+    backend_known "$BACKEND" || die "unknown --llm-backend '$BACKEND' (known: $BACKEND_LIST)"
+    [ "$BACKEND" != anthropic ] || die "anthropic does not publish a model list here — see docs.claude.com/en/docs/about-claude/models"
+    export SANDBOX_LLM_URL="$LLM_URL"
+    backend_load "$BACKEND"
+    echo "sandbox: models at $B_URL"
+    printf 'MODEL\tPARAMS\tSIZE\tTOOLS\tCAPABILITIES\n'
+    python3 "$HARNESS_LIB_DIR/probe_models.py" "$B_URL"
+    ;;
+
+  flywheel)
+    # Read the LLM traffic captured by the gateway (sandbox up --flywheel).
+    NAME=""
+    while [ $# -gt 0 ]; do case "$1" in
+      --name) NAME="$2"; shift 2;;
+      --) shift; break;;
+      *) break;;
+    esac; done
+    [ -n "$NAME" ] || { [ -f "$DC/.env" ] && . "$DC/.env" && NAME="$SANDBOX_NAME"; }
+    [ -n "$NAME" ] || die "--name required"
+    CAP="$DC/.broker-control-$NAME/flywheel"
+    [ -d "$CAP" ] || die "no captures for '$NAME' — bring it up with:  ./sandbox up --flywheel ..."
+    [ $# -gt 0 ] || set -- stats
+    exec python3 "$HERE/broker/flywheel.py" --dir "$CAP" "$@"
     ;;
 
   run)
@@ -465,6 +762,6 @@ EOF
     ;;
 
   *)
-    sed -n '2,25p' "$0"
+    sed -n '2,36p' "$0"
     ;;
 esac

@@ -655,3 +655,188 @@ a manual `sandbox tools` shell is gated by the gateway only.
 to validate the rootless-dropbear login, cross-uid key mounts, and `hunter` wrapper — the
 in-sandbox session has no Docker socket. Prereq: pre-build `bb-hunter:latest`
 (`cd tooling/docker && docker compose build`).
+
+---
+
+## 17. Harness abstraction — swapping the agent and the model
+
+The sandbox was built around Claude Code, but nothing in the security model is
+Claude-specific: the gateway does not care which process makes the request. Four
+Claude-shaped assumptions were what actually tied the workload to one harness — the
+image's `npm i -g @anthropic-ai/claude-code`, the `~/.claude` home bind, `sandbox open`
+hardcoding `claude --dangerously-skip-permissions`, and `api.anthropic.com` in the
+allowlist. §17 lifts those four into a registry.
+
+**Two orthogonal axes.** *Harness* = which agent CLI runs (`claudecode`, `pi`, `omp`,
+`prime-agent`). *Backend* = where tokens come from (`anthropic`, `ollama`,
+`openai-compat`). They compose: `--harness pi --llm-backend anthropic` and
+`--harness claudecode --llm-backend ollama` are both meaningful.
+
+**The registry** (`.devcontainer/harness/`) is sourced by *both* the host CLI and the
+workload, so the two can never disagree about what a harness is called or needs:
+
+| file | defines |
+|---|---|
+| `harnesses/<name>.sh` | `H_BIN`, `H_HOME`, `H_DOMAINS`, `h_install`, `h_configure`, `h_launch` |
+| `backends/<name>.sh` | `B_URL`, `B_OPENAI_URL`, `B_ANTHROPIC_URL`, `B_API`, `B_KEY`, `B_DOMAINS` |
+| `install.sh` | build-time installer, one Dockerfile `RUN` per harness |
+| `run.sh` → `sandbox-harness` | in-workload: configure, then exec the agent |
+| `models_config.py` | renders the pi-family provider block (JSON or YAML) |
+| `probe_models.py` | host-side: list models, pick a default, read context windows |
+
+Two install-time facts the registry has to encode, both discovered by actually running
+them: **omp's published binary is a bun bundle** (`#!/usr/bin/env bun`, `engines.bun >=
+1.3.14`) — npm installs it but it will not run without bun, so its `h_install` installs
+bun from npm first; and **prime-agent is not on the npm registry**, it ships as a
+sha256-listed tarball in an R2 bucket, so it is fetched and verified directly rather than
+through its `curl | sh` installer.
+
+**All four harnesses are baked into the image** (one cache layer each). Selecting one is
+a runtime decision passed per `docker compose exec -e`, so `sandbox open --harness omp`
+switches agents with no rebuild, no restart, and no loss of broker credentials. Each gets
+its own shared host home (`$SANDBOX_HOMES/<harness>-home`, Claude Code keeping its
+historical `~/.sandbox/claude-home`), so a login or learned skill follows you into every
+sandbox — the §11 property, per harness.
+
+**Config generation.** pi, omp and prime-agent share one provider schema
+(`providers.<name>.{baseUrl,api,apiKey,models[]}`), differing only in path and encoding —
+so one writer serves all three. Two details are load-bearing:
+
+- *Colon-free aliases.* Ollama ids (`qwen3.5:35b`) collide with the pi-family model
+  selector, where `:` introduces a thinking level (`--model sonnet:high`). Every generated
+  entry carries a `name` with `:` replaced, and that alias is what `--model` is given.
+- *Real context windows.* An unrecognised model gets a default window (128k pi-family,
+  200k Claude Code). The CLI probes `/api/show` at `up` and writes the true number
+  (`contextWindow`, or `CLAUDE_CODE_MAX_CONTEXT_TOKENS`) — otherwise a 32k model is fed
+  200k of context, or a 262k model is compacted at a quarter full.
+
+A generated config carries a sidecar marker; a file we did not write is moved to
+`<file>.pre-sandbox` rather than clobbered, and providers you add by hand survive
+regeneration.
+
+**Credentials are unchanged, and that is the point.** With `--llm-backend anthropic` a
+pi-family harness gets a placeholder `ANTHROPIC_API_KEY` in the workload while the gateway
+injects the real credential by host (§4) — injection overwrites the placeholder header, so
+it never reaches the API. Claude Code keeps using the OAuth session in its shared home.
+Local backends need no credential at all, which is a real reduction in exposure: with
+`--harness pi --llm-backend ollama` there is no model credential in the system.
+
+**Claude Code against a local model works** because Ollama ≥ 0.12 serves the Anthropic
+Messages API at `/v1/messages`, so `ANTHROPIC_BASE_URL` can point straight at it — no
+translating proxy in the path. For a generic `openai-compat` endpoint that guarantee does
+not hold, so `claudecode` refuses it unless `--llm-anthropic-compat` asserts it.
+
+**Egress follows the selection.** `--harness`/`--llm-backend` append their `H_DOMAINS` /
+`B_DOMAINS` to the per-sandbox allowlist automatically, including the backend host parsed
+out of `--llm-url`; `open` tops it up on a switch (hot-reloaded, no restart).
+
+**Non-goals.** No harness-agnostic skills/agents layer — Minions agents and skills stay
+wired to Claude Code only; the others have their own formats. No cross-harness session
+migration.
+
+**Note on permission systems.** pi deliberately ships none, and omp/prime-agent do not
+enforce one either. Inside this sandbox that changes nothing: the container, the FUSE
+filter and the gateway *are* the boundary, and Claude Code already runs
+`--dangerously-skip-permissions` here for the same reason (§3.5). Outside a sandbox that
+is a very different proposition.
+
+---
+
+## 18. Flywheel — capturing model traffic (opt-in)
+
+"Flywheel" here is the loop *route → observe → evaluate → specialize → deploy*: run real
+work against a strong model, keep the traces, and use them to fine-tune or evaluate a
+local model on **your** distribution instead of on a public benchmark. §18 implements the
+*observe* step; routing and training stay outside the sandbox.
+
+**Why the gateway is the right place.** It already terminates TLS for every allowed host,
+so one addon captures every model call from every harness against every backend, in one
+shape. No harness plugin, no wrapper process, nothing for the workload to notice or
+disable. `sandbox up --flywheel` sets `FLYWHEEL=1`, which makes the gateway entrypoint
+load `flywheel_addon.py` alongside the broker addon (the security-critical addon is
+untouched when the flag is off).
+
+**What a record holds:** timestamp, host, path, model, user-agent (which is how a mixed
+capture is split per harness), stream flag, status, duration, the full request JSON, and
+the assembled completion — text, tool calls, usage, stop reason. Anthropic and OpenAI SSE
+transcripts are reassembled into that same shape; `flywheel_addon_test.py` covers both.
+
+**Explicitly not redacted.** Unlike `requests.log`, which is redacted by construction
+(§15), these records contain prompts, source, tool output — whatever the agent saw. They
+are written to the per-sandbox control dir on the **host**, which the workload cannot see
+and git ignores. Request headers are *not* captured, so a broker-injected credential never
+lands in the corpus — but a secret pasted into a prompt would. Treat the capture dir like
+the source tree it mirrors. It is off by default for exactly this reason.
+
+**Bounded on disk:** per-file rotation and a total budget, oldest first, so a long
+autonomous run cannot fill the host disk.
+
+**Reading it back:** `sandbox flywheel stats | tail | export`. Export emits OpenAI-messages
+or ShareGPT JSONL. Two honest caveats: structured content (tool results, images) is
+flattened to text, and a response streamed past mitmproxy's `stream_large_bodies` threshold
+arrives empty — those records keep the request, are skipped by export, and are counted in
+`stats` so the gap is visible rather than silent.
+
+**Status:** addon + reader unit-tested; the capture path needs a real bring-up to confirm
+volume under load. Routing (a local/frontier splitter) is deliberately not built — with
+`--model`/`--small-model` you can already put the cheap slot on a local model and keep the
+main one on a frontier model, which is most of the benefit without a new component inside
+the security boundary.
+
+---
+
+## 19. Web search — one endpoint, four harnesses
+
+Search is the capability the harness split exposed. Claude Code's `WebSearch` is a
+**server-side Anthropic tool**, so it evaporates the moment `ANTHROPIC_BASE_URL` points at
+a local model; pi ships no web tool at all (4 tools, by design); prime-agent has none
+documented, only an IPython REPL that can call anything; and omp has a built-in
+`web_search` with 23 providers. Four different stories for one need.
+
+**The unifying decision: one search endpoint, outside the sandbox.** A SearXNG instance
+runs on the LAN/server box (see `tooling/searxng/`), and the sandbox reaches it as a single
+allowlisted host. Why not a sidecar — the obvious symmetry with the tools sidecar (§16) —
+is the whole argument: a sidecar shares the gateway netns, so **SearXNG's own upstream
+traffic would be subject to the allowlist and MITM**. That means allowlisting google,
+duckduckgo, startpage, bing, … (a wide hole in the boundary this project exists to defend)
+*and* feeding MITM'd, datacenter-shaped traffic to engines that bot-detect exactly that.
+Outside, the scraping happens beyond the containment, one hostname goes on the allowlist,
+and every sandbox — plus anything else on the network — shares the instance.
+
+**How each harness gets it:**
+
+| harness | mechanism |
+|---|---|
+| omp | native `web_search`, pointed at the same instance via `SEARXNG_ENDPOINT` |
+| pi, prime-agent, claudecode | the `websearch` command baked into the workload image |
+
+`websearch` (stdlib Python, in `.devcontainer/harness/`) queries the JSON API and prints
+ranked title/URL/snippet. Every harness has `bash`, so this is the common denominator —
+no per-harness plugin, no MCP server, no extension ecosystem to track. Its error messages
+name the three failures a fresh SearXNG produces (JSON format disabled, limiter rejecting
+non-browser clients, `method: POST` breaking the GET API) so they are diagnosable from
+inside the sandbox rather than looking like "search is broken".
+
+**Telling the model it exists.** A command on `PATH` is invisible to a model. All four
+harnesses happen to read the *same* `SKILL.md` convention — Claude Code's, adopted by pi,
+omp and prime-agent — so one generated skill in each harness home covers all of them. It is
+written when `--search-url` is set and withdrawn when search is turned off, so the model is
+never advertised a command that can only fail. One exception: Claude Code's `skills/` is
+usually a symlink to the read-only Minions mount, so the skill is skipped there with a note
+— add it to the Minions skills repo if you want local Claude Code to reach for search on
+its own.
+
+**Snippets only, deliberately.** Search returns snippets; reading a linked page needs that
+domain allowlisted with `sandbox allow --url`. The tempting next step — a reader/fetch
+proxy on the search host, or a "GET anywhere, never inject credentials" lane in the gateway
+— is by construction an exfiltration channel: the URL carries the payload out. Both are
+implementable behind their own opt-in flag, but neither ships, and the generated skill
+explicitly tells the model not to route around the allowlist but to name the domain it
+needs.
+
+**Alternatives considered.** Brave Search API / Tavily / Exa are more reliable than
+scraping and fit the broker beautifully (the key lives in the gateway and never enters the
+workload) — the cost is money and a cloud dependency, so they stay a documented option
+rather than the default. omp's keyless engines (DuckDuckGo, Startpage, Ecosia, Google,
+Mojeek) work with no infrastructure at all, but only for omp, and only by allowlisting
+those engines directly — the sidecar problem again, minus the sidecar.

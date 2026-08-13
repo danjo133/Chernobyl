@@ -13,7 +13,7 @@
  │/run/.../view │──► │  devcontainer — the workload                      │
  │ filtered repo│bind│  network_mode: service:gateway                    │
  └──────────────┘    │  • NO net caps — cannot read/alter egress rules   │
-                     │  • Claude Code + toolchain                        │
+                     │  • agent harness (claudecode/pi/omp/…) + toolchain│
    HOST-side filler  │  • has opaque handles / nothing — never real creds│
    tool / MCP ─────► │  • trusts mitmproxy CA                            │
    (runs real OAuth) └───────────────────────────────────────────────────┘

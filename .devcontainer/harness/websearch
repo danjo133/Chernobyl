@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""websearch — query the sandbox's search endpoint from inside the workload.
+
+One command, every harness. omp has a native `web_search` tool (pointed at the same
+endpoint via SEARXNG_ENDPOINT), but pi and prime-agent ship no web tool at all, and Claude
+Code loses its server-side WebSearch the moment it runs against a local model — all three
+have `bash`, so this is the common denominator. A generated skill in each harness home
+tells the model the command exists. See docs/SANDBOX-PLAN.md §19.
+
+  websearch [-n N] [--json] [--category CAT] QUERY...
+
+Endpoint comes from SANDBOX_SEARCH_URL (or SEARXNG_ENDPOINT). Results are snippets: to
+READ a linked page the sandbox operator must allowlist that domain
+(`./sandbox allow --url example.com`) — deliberately not automatic, since a general fetch
+lane out of a contained sandbox is an exfiltration channel.
+"""
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+TIMEOUT = int(os.environ.get("WEBSEARCH_TIMEOUT", "30"))
+SNIPPET_MAX = 400
+
+
+def endpoint():
+    url = os.environ.get("SANDBOX_SEARCH_URL") or os.environ.get("SEARXNG_ENDPOINT") or ""
+    if not url:
+        sys.exit(
+            "websearch: no search endpoint configured.\n"
+            "  The sandbox was started without one. On the host:\n"
+            "    ./sandbox open --name <sandbox> --search-url https://searxng.example.com"
+        )
+    return url.rstrip("/")
+
+
+def search(query, category=None):
+    params = {"q": query, "format": "json"}
+    if category:
+        params["categories"] = category
+    url = f"{endpoint()}/search?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={"accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as exc:
+        # The two failures every fresh SearXNG hits, named so they are actionable from
+        # in here rather than looking like "search is broken".
+        hint = ""
+        if exc.code == 403:
+            hint = "\n  hint: the instance's limiter is rejecting non-browser clients (server.limiter: false)"
+        elif exc.code == 405:
+            hint = "\n  hint: the instance is set to method: POST — the JSON API needs GET"
+        elif exc.code == 404:
+            hint = "\n  hint: JSON output may be disabled (search.formats must include json)"
+        sys.exit(f"websearch: {endpoint()} returned HTTP {exc.code}{hint}")
+    except (urllib.error.URLError, OSError) as exc:
+        sys.exit(
+            f"websearch: cannot reach {endpoint()} ({exc})\n"
+            "  if this is a new endpoint, the sandbox may not have it allowlisted yet:\n"
+            "    ./sandbox allow --name <sandbox> --url <search host>"
+        )
+    except ValueError:
+        sys.exit(f"websearch: {endpoint()} did not return JSON (is search.formats missing 'json'?)")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="websearch", description="Search the web via the sandbox's search endpoint.")
+    ap.add_argument("query", nargs="+")
+    ap.add_argument("-n", type=int, default=8, help="max results (default 8)")
+    ap.add_argument("--json", action="store_true", help="raw JSON instead of text")
+    ap.add_argument("--category", help="searxng category, e.g. news, science, it")
+    args = ap.parse_args()
+
+    data = search(" ".join(args.query), args.category)
+    results = (data.get("results") or [])[: args.n]
+
+    if args.json:
+        json.dump({"query": " ".join(args.query), "results": results}, sys.stdout, indent=2)
+        print()
+        return
+    if not results:
+        print("websearch: no results")
+        if data.get("unresponsive_engines"):
+            print(f"  unresponsive engines: {data['unresponsive_engines']}")
+        return
+    for i, r in enumerate(results, 1):
+        content = " ".join((r.get("content") or "").split())[:SNIPPET_MAX]
+        print(f"{i}. {r.get('title') or '(untitled)'}")
+        print(f"   {r.get('url')}")
+        if content:
+            print(f"   {content}")
+    if data.get("answers"):
+        print(f"\nanswers: {'; '.join(str(a) for a in data['answers'])}")
+
+
+if __name__ == "__main__":
+    main()

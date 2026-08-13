@@ -15,6 +15,10 @@
 
   "remoteUser": "node",
 
+  // NOTE: this VS Code path is Claude-Code-specific by nature (the extension below).
+  // Harness selection (pi / omp / prime-agent) happens on the CLI path instead:
+  // `./sandbox open --harness X`. All four are installed in the image either way.
+
   "containerEnv": {
     "CLAUDE_CONFIG_DIR": "/home/node/.claude",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",

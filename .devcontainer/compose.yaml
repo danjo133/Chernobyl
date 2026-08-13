@@ -25,6 +25,9 @@ services:
     environment:
       # 1 = unrestricted egress (no allowlist, no MITM). Set by `sandbox --allow-internet`.
       ALLOW_INTERNET: "${ALLOW_INTERNET:-0}"
+      # 1 = capture LLM request/response bodies for every harness (`sandbox up --flywheel`).
+      # Off by default: unlike requests.log these records are NOT redacted. See §18.
+      FLYWHEEL: "${FLYWHEEL:-0}"
     volumes:
       - gateway-ca:/home/mitm/.mitmproxy            # mitmproxy confdir incl. CA PRIVATE KEY — gateway only
       - ca-pub:/ca-pub                              # PUBLIC cert only, populated by entrypoint, shared ro to workload
@@ -35,6 +38,7 @@ services:
       - ./gateway/scopes.yaml:/etc/broker/scopes.yaml:ro
       - ./gateway/broker_addon.py:/opt/broker/broker_addon.py:ro
       - ./gateway/control_server.py:/opt/broker/control_server.py:ro
+      - ./gateway/flywheel_addon.py:/opt/broker/flywheel_addon.py:ro
       # Host-side credential filler talks to the broker over this control socket dir.
       # NOT mounted into the workload (different mount namespace) — see broker/README.md.
       - ${BROKER_CONTROL_DIR:-./.broker-control}:/run/broker-control
@@ -77,6 +81,13 @@ services:
       # settings, agents/skills symlinks, and session logs — shared across all
       # sandboxes. Host dir is owned by uid 1000 == node, so no volume-ownership dance.
       - ${SANDBOX_CLAUDE_HOME:?set SANDBOX_CLAUDE_HOME (sandbox CLI sets this)}:/home/node/.claude
+      # Same deal for the other harnesses: one shared host home each, so a login /
+      # session history / learned skills follow you into every sandbox. All four are
+      # mounted regardless of --harness (an unused one is just an empty dir), so you can
+      # switch harness with `sandbox open --harness X` without recreating the container.
+      - ${SANDBOX_PI_HOME:?set SANDBOX_PI_HOME (sandbox CLI sets this)}:/home/node/.pi
+      - ${SANDBOX_OMP_HOME:?set SANDBOX_OMP_HOME (sandbox CLI sets this)}:/home/node/.omp
+      - ${SANDBOX_PRIME_HOME:?set SANDBOX_PRIME_HOME (sandbox CLI sets this)}:/home/node/.prime
       # Minions toolkit, read-only, at the path settings.template.json expects
       # ($HOME/dev/Minions with $HOME=/home/node) so hook paths resolve verbatim.
       # The `sandbox` CLI always writes MINIONS_DIR into .env; this default is only a

@@ -5,13 +5,34 @@
 # Anything not listed is DENIED. Telemetry domains are intentionally omitted
 # (disabled via CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1). See docs/SANDBOX-PLAN.md §6.
 
-# --- Claude Code core ---
+# --- Claude Code core (harness: claudecode) ---
 api.anthropic.com
 console.anthropic.com
 claude.ai
 platform.claude.com
 downloads.claude.ai
 raw.githubusercontent.com
+
+# --- other harnesses (pi / omp / prime-agent): version + model-catalog refresh ---
+# The harnesses themselves are baked into the image, so these are only needed at
+# runtime. `sandbox up --harness X` appends the ones X needs automatically; the DENY
+# log plus `sandbox allow --url ...` covers anything a new release starts calling.
+pi.dev
+omp.sh
+models.dev
+app.primeintellect.ai
+api.primeintellect.ai
+
+# --- LLM backends other than Anthropic (added per sandbox by --llm-backend/--llm-url) ---
+# e.g. your Ollama box:
+# ollama.example.com
+
+# --- web search (added per sandbox by --search-url) ---
+# ONE host: the search instance does the engine-scraping outside this containment, which
+# is why it runs on your server box and not as a sidecar (tooling/searxng/, plan §19).
+# Search returns snippets only — reading a result page still needs that domain allowed
+# explicitly with `sandbox allow --url`, which is the point.
+# searxng.example.com
 
 # --- git / GitHub ---
 github.com

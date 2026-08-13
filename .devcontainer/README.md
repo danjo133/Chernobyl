@@ -1,4 +1,4 @@
-# Claude Code sandbox — scaffold
+# Agent sandbox — scaffold
 
 A reusable, hardened devcontainer: external egress firewall + credential broker,
 host-side gitignore FUSE filter, multi-sandbox + local-dev support. Full design and
@@ -15,16 +15,18 @@ rationale in [`docs/SANDBOX-PLAN.md`](../docs/SANDBOX-PLAN.md).
 |---|---|
 | `compose.yaml` | gateway + devcontainer topology (workload shares gateway netns) |
 | `devcontainer.json` | VS Code entry: compose service, FUSE mount hook, CA-trust postCreate |
-| `devcontainer.Dockerfile` | workload image: Claude Code + toolchain + CA trust env |
+| `devcontainer.Dockerfile` | workload image: all four agent harnesses + toolchain + CA trust env |
+| `harness/` | harness + backend registry (see plan §17) — sourced by both the `sandbox` CLI and the workload; `install.sh` runs at build, `run.sh` becomes `sandbox-harness` inside |
+| `harness/websearch` | in-container search client (plan §19): one command every harness can call, pointed at `--search-url`; installed to `/usr/local/bin/websearch` |
 | `trust-ca.sh` | installs the gateway MITM CA into the workload |
 | `managed-settings.json` | org policy (telemetry off, bypass perms in the contained env) |
 | `build-dirs.txt` | build/dep dirs backed by per-sandbox volumes |
 | `containers/` | rootless Podman/Buildah config (vfs storage, single-UID) for in-workload image builds |
 | `compose.imagebuild.yaml` | opt-in overlay (`--allow-image-build`): appends seccomp/apparmor=unconfined for rootless image builds |
-| `gateway/` | mitmproxy + iptables + redis broker (the firewall + credential boundary) |
+| `gateway/` | mitmproxy + iptables + redis broker (the firewall + credential boundary), plus the opt-in `flywheel_addon.py` LLM-traffic capture (plan §18) |
 | `fusefilter/` | host-side gitignore-driven filtered view (Go + go-fuse) |
 | `../broker/` | host-side credential filler (runs real OAuth, mints scoped handles) |
-| `../sandbox` | CLI: `up \| ls \| down \| open` (worktrees, project naming, ports) |
+| `../sandbox` | CLI: `up \| ls \| down \| open \| models \| flywheel` (worktrees, project naming, ports, harness/model selection) |
 
 ## Bring-up order (once Bash works) — maps to plan §14
 
@@ -36,6 +38,29 @@ rationale in [`docs/SANDBOX-PLAN.md`](../docs/SANDBOX-PLAN.md).
    tracked files appear on the host, builds write to the volume-backed dirs.
 4. **Broker** — mint a handle with `broker/fill.py`, confirm injection works and the real
    credential is absent from the container (env, files, `/proc`).
+
+## Agent harnesses
+
+The image ships **four** harnesses, one Docker layer each, so switching is a runtime
+choice (`./sandbox open --harness X`) with no rebuild:
+
+| harness | binary | installed from | notes |
+|---|---|---|---|
+| `claudecode` | `claude` | npm `@anthropic-ai/claude-code` | org policy via `managed-settings.json`; Minions agents/skills wiring |
+| `pi` | `pi` | npm `@earendil-works/pi-coding-agent` (`--ignore-scripts`) | smallest system prompt — the best fit for local models |
+| `omp` | `omp` | npm `@oh-my-pi/pi-coding-agent` | **also installs `bun`**: omp's published binary is a bun bundle and will not run without it |
+| `prime-agent` | `prime-agent` | R2 release tarball, sha256-verified, then `npm i -g` | not on the npm registry; the installer's own `curl \| sh` is deliberately not used |
+
+**Web search** is wired the same way for all four: `--search-url` puts one host on the
+allowlist, sets `SEARXNG_ENDPOINT` for omp's native `web_search` tool, and installs a
+`websearch` skill into each harness home (they all read Claude Code's `SKILL.md` format).
+Claude Code's own `skills/` is usually a symlink to the read-only Minions mount, so the
+skill is skipped there — the `websearch` command is still on PATH, and you can add the
+skill to Minions yourself. See [plan §19](../docs/SANDBOX-PLAN.md).
+
+Each keeps its state in its own shared host home (`~/.claude`, `~/.pi`, `~/.omp`,
+`~/.prime` inside the container). Model/provider config is generated per launch from
+`--llm-backend`/`--model`; see [plan §17](../docs/SANDBOX-PLAN.md#17-harness-abstraction--swapping-the-agent-and-the-model).
 
 ## Workload toolchain
 

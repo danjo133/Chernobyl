@@ -153,6 +153,14 @@ runuser -u "$PROXY_USER" -- python3 /opt/broker/control_server.py &
 # lets past; root's packets to Caido are dropped by the OUTPUT chain.
 # ---------------------------------------------------------------------------
 MITM_EXTRA=""
+# Opt-in LLM traffic capture (sandbox up --flywheel). Loaded as a second addon so the
+# security-critical broker addon stays untouched when it is off. See §18.
+FLYWHEEL_ADDON=""
+if [ "${FLYWHEEL:-0}" = "1" ]; then
+  FLYWHEEL_ADDON="-s /opt/broker/flywheel_addon.py"
+  echo "gateway: FLYWHEEL=1 — capturing LLM request/response bodies to the control dir."
+fi
+
 CAIDO_MARKER=/run/broker/caido-upstream
 rm -f "$CAIDO_MARKER"
 if [ -n "${CAIDO_UPSTREAM:-}" ]; then
@@ -188,7 +196,7 @@ fi
 # ---------------------------------------------------------------------------
 # mitmproxy (transparent). The addon does allowlist + credential injection.
 # ---------------------------------------------------------------------------
-# shellcheck disable=SC2086  # MITM_EXTRA is intentionally word-split into flags.
+# shellcheck disable=SC2086  # MITM_EXTRA/FLYWHEEL_ADDON are intentionally word-split into flags.
 runuser -u "$PROXY_USER" -- mitmdump \
   --mode transparent --showhost \
   --listen-port "$MITM_PORT" \
@@ -196,7 +204,7 @@ runuser -u "$PROXY_USER" -- mitmdump \
   --set block_global=false \
   --set stream_large_bodies=10m \
   $MITM_EXTRA \
-  -s /opt/broker/broker_addon.py &
+  -s /opt/broker/broker_addon.py $FLYWHEEL_ADDON &
 MITM_PID=$!
 
 # ---------------------------------------------------------------------------

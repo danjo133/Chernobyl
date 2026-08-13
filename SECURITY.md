@@ -81,6 +81,37 @@ makes them hold.
   sustained red-teaming. Treat "credentials never leak / egress is contained" as a strong
   design intent, not a proof.
 
+## Harness choice does not change the boundary
+
+The agent CLI is selectable (`--harness claudecode|pi|omp|prime-agent`) and none of the
+guarantees above depend on which one runs: the gateway does not care what process makes a
+request, and the FUSE filter does not care what process reads a file. Two consequences worth
+stating plainly:
+
+- **pi, omp and prime-agent have no permission system at all** (pi says so explicitly). Inside
+  this sandbox that matches what Claude Code already does here — `bypassPermissions`, because
+  the container *is* the blast radius. Outside a sandbox it is a very different proposition.
+- **A local backend removes a credential rather than adding one.** With `--llm-backend ollama`
+  there is no model API key anywhere in the system. With `anthropic`, the pi-family harnesses
+  carry only a placeholder key and the gateway injects the real one on egress, exactly as for
+  every other credential (§4).
+
+## Flywheel captures are deliberately unredacted
+
+`sandbox up --flywheel` records full LLM request and response bodies at the gateway. This is
+the one place in the system that stores model *content* rather than metadata:
+
+- The egress request log is redacted by construction (header names, never values; no bodies).
+  Flywheel captures are the opposite: prompts, source code, tool output, everything the agent
+  saw. A secret the agent *read* can therefore end up in a capture.
+- Request **headers** are never captured, so broker-injected credentials do not reach the
+  corpus.
+- Captures live in the per-sandbox control dir on the **host** — outside the workload's mount
+  namespace (it cannot read back what it generated) and gitignored — under the same
+  single-user-host assumption as the rest of that directory.
+- It is off by default, and `stats`/`export` never send anything anywhere. Before sharing or
+  training on an export, review it as you would the source tree it mirrors.
+
 ## Opt-in escape hatches (they drop containment on purpose)
 
 Each requires an explicit flag on the **host** — the in-container agent cannot invoke them:

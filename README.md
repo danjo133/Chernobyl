@@ -1,9 +1,10 @@
-# Claude Code Sandbox
+# Agent Sandbox
 
-A reusable, hardened devcontainer for running Claude Code — including
-`--dangerously-skip-permissions` — against untrusted-ish autonomous work. It wraps
-the workload in three independent boundaries so a bypassed or fully-autonomous
-session can do only bounded damage:
+A reusable, hardened devcontainer for running a coding agent — Claude Code, [pi](https://pi.dev),
+[omp](https://omp.sh) or [prime-agent](https://github.com/PrimeIntellect-ai/prime-agent), against
+Anthropic or a local model — with permission prompts off, doing untrusted-ish autonomous work. It
+wraps the workload in three independent boundaries so a bypassed or fully-autonomous session can do
+only bounded damage:
 
 1. **An external egress firewall** the workload's traffic *must* traverse — enforced
    in a separate container the workload shares a network namespace with but holds no
@@ -14,6 +15,9 @@ session can do only bounded damage:
 3. **A credential broker** so the container can *use* credentials (Anthropic, GitHub,
    Kubernetes, cloud) without ever *holding* the real secret — the human
    authenticates on the host, the container carries only an opaque, scoped handle.
+
+The agent harness and the model backend are both swappable at launch
+(`--harness`, `--llm-backend`) — see [Harnesses & LLM backends](#harnesses--llm-backends).
 
 The full design, rationale, and threat model live in
 [`docs/SANDBOX-PLAN.md`](docs/SANDBOX-PLAN.md). Read that for the *why*; this README
@@ -55,13 +59,15 @@ service:gateway` (firewall outside the workload's reach) and the gateway-as-brok
 
 | Path | What |
 |---|---|
-| [`sandbox`](sandbox) | the CLI — `up \| ls \| allow \| web \| tools \| open \| down`. Manages worktrees, project naming, port auto-assignment, egress flags. Start here. |
+| [`sandbox`](sandbox) | the CLI — `up \| ls \| allow \| web \| tools \| open \| models \| flywheel \| down`. Manages worktrees, project naming, port auto-assignment, harness/model selection, egress flags. Start here. |
 | [`.devcontainer/`](.devcontainer/) | the sandbox itself: compose topology, workload image, gateway, FUSE filter, tools sidecar. See its [README](.devcontainer/README.md). |
-| `.devcontainer/gateway/` | mitmproxy + iptables + redis — the firewall and credential boundary (`broker_addon.py`, `control_server.py`) |
+| `.devcontainer/harness/` | harness + backend registry (Claude Code / pi / omp / prime-agent × Anthropic / Ollama / OpenAI-compatible), shared by the CLI and the workload |
+| `.devcontainer/gateway/` | mitmproxy + iptables + redis — the firewall and credential boundary (`broker_addon.py`, `control_server.py`, opt-in `flywheel_addon.py`) |
 | `.devcontainer/fusefilter/` | host-side gitignore-driven filtered view (Go + go-fuse) |
 | `.devcontainer/tools/` | bb-hunter sidecar image (opt-in `--tools`): recon/scanning tooling Claude drives over SSH, egress contained through the gateway |
-| [`broker/`](broker/) | host-side credential broker: `webui.py` (password-gated web app) + `fill.py` (CLI filler) that run real OAuth and mint scoped handles. See its [README](broker/README.md). |
+| [`broker/`](broker/) | host-side credential broker: `webui.py` (password-gated web app) + `fill.py` (CLI filler) that run real OAuth and mint scoped handles, plus `flywheel.py` (read/export captured LLM traffic). See its [README](broker/README.md). |
 | [`tooling/`](tooling/) | standalone bug-bounty tooling (bb-hunter image, scope guard, MCP/LiteLLM helpers) — usable outside a sandbox too |
+| [`tooling/searxng/`](tooling/searxng/) | deploy-it-yourself SearXNG (compose + settings) that gives every harness web search through one allowlisted host — runs **outside** the sandbox, see its [README](tooling/searxng/README.md) |
 | [`docs/SANDBOX-PLAN.md`](docs/SANDBOX-PLAN.md) | full design, threat model, phased plan |
 
 ## Quickstart
@@ -74,8 +80,12 @@ Prerequisites (plan §9): **rootless Docker** (recommended) or Podman with
 # installs the MITM CA, starts the compose project):
 ./sandbox up --source /path/to/repo
 
-# Open an interactive Claude Code session inside it:
+# Open an interactive agent session inside it (asks which harness on first use):
 ./sandbox open --name cc-repo
+
+# …or pick the harness and the model up front:
+./sandbox up --source /path/to/repo --harness pi --llm-backend ollama \
+             --llm-url https://ollama.example.com
 
 # List sandboxes (with broker-UI / app / caido ports + password) / tear one down:
 ./sandbox ls
@@ -93,6 +103,11 @@ Useful `up` flags:
 |---|---|
 | `--name NAME` | explicit sandbox name (default derived from the source dir) |
 | `--worktree BRANCH` | isolate same-repo tasks via a git worktree (separate dir + branch) |
+| `--harness H` | agent CLI: `claudecode` (default), `pi`, `omp`, `prime-agent` |
+| `--llm-backend B` | `anthropic` (default), `ollama`, `openai-compat` |
+| `--llm-url URL` | backend endpoint (required for `openai-compat`) |
+| `--model ID` / `--small-model ID` | model ids; for a local backend both are auto-picked (largest / smallest tool-capable) if omitted |
+| `--flywheel` | record every LLM call for later distillation or eval — **unredacted**, see below |
 | `--port HOST:CTR` | publish an app port explicitly. **Omit it** and a free host port (from 3000) is auto-assigned → container `:3000`, so parallel sandboxes never collide. |
 | `--web-port N` | pin the host-only broker UI port (default: first free from 9999). |
 | `--tools` | add the bb-hunter tools sidecar + Caido proxy — Claude drives recon tooling over SSH, egress still contained through the gateway. |
@@ -103,9 +118,88 @@ Useful `up` flags:
 
 Each sandbox is its own compose project (`COMPOSE_PROJECT_NAME`) with isolated
 networks, volumes, allowlist, and MITM log — so several run in parallel without
-crossing wires (plan §11). Auth and agents come from a shared host-side Claude home
-(`SANDBOX_CLAUDE_HOME`, default `~/.sandbox/claude-home`); log in once and every
-sandbox inherits it.
+crossing wires (plan §11). Auth and agents come from a shared host-side home **per
+harness** (`SANDBOX_HOMES`, default `~/.sandbox/homes/<harness>-home`; Claude Code keeps
+`~/.sandbox/claude-home`); log in once per harness and every sandbox inherits it.
+
+## Harnesses & LLM backends
+
+Two independent choices, composable in any combination (plan §17):
+
+| `--harness` | what it is |
+|---|---|
+| `claudecode` | Claude Code — subagents, hooks, MCP, the Minions agents/skills wiring |
+| `pi` | [pi](https://pi.dev) — 4 tools and a tiny system prompt; the best fit for local models |
+| `omp` | [omp / oh-my-pi](https://omp.sh) — pi fork with LSP, DAP debugging, 30+ tools |
+| `prime-agent` | [prime-agent](https://github.com/PrimeIntellect-ai/prime-agent) — RLM (tools as calls in a persistent IPython REPL) + a self-refining harness |
+
+| `--llm-backend` | notes |
+|---|---|
+| `anthropic` | default. Claude Code uses its OAuth session; the pi-family harnesses get a placeholder key while the gateway injects the real one — no model credential in the container either way. |
+| `ollama` | your own box. Serves both the OpenAI API (pi family) and, since 0.12, `/v1/messages` — so **Claude Code talks to a local model directly**, no translating proxy. Defaults to `http://localhost:11434`; for a box on your network export `SANDBOX_OLLAMA_URL` once or pass `--llm-url`. |
+| `openai-compat` | anything else (vLLM, llama.cpp, LM Studio, OpenRouter, a router): `--llm-url` required. `claudecode` needs `--llm-anthropic-compat` to confirm the endpoint also serves `/v1/messages`. |
+
+All four harnesses are baked into the image, so switching one is a runtime decision —
+no rebuild, no restart, credentials in the broker survive:
+
+```bash
+./sandbox models --llm-backend ollama --llm-url https://ollama.example.com   # what can it run?
+./sandbox open --name cc-repo --harness omp --model qwen3.5:35b             # switch, in place
+```
+
+The CLI picks a default model for a local backend (largest tool-capable), reads each
+model's **real context window** from the backend so the harness does not assume its own
+default, and appends whatever domains the harness and backend need to the sandbox's
+egress allowlist.
+
+## Web search
+
+Claude Code's `WebSearch` is a server-side Anthropic tool, so it disappears the moment you
+point the harness at a local model; pi and prime-agent ship no web tool at all; omp has a
+native one. One endpoint fixes all four (plan §19):
+
+```bash
+# deploy once, on your server box — NOT in the sandbox (see tooling/searxng/README.md)
+cd tooling/searxng && cp env.example .env && $EDITOR .env && docker compose up -d
+
+# then point sandboxes at it
+./sandbox up --source ~/dev/repo --search-url https://searxng.example.com
+./sandbox open --name cc-repo --search none          # or turn it back off
+```
+
+That adds **one** host to the egress allowlist, sets `SEARXNG_ENDPOINT` for omp's native
+`web_search`, points the in-container `websearch` command at it, and installs a `websearch`
+skill into each harness home so the model knows the command exists (all four harnesses read
+the same `SKILL.md` format).
+
+It is deliberately **snippets only**: reading a result page still needs
+`./sandbox allow --url <domain>`. A general fetch lane out of a contained sandbox is an
+exfiltration channel, so it is not on by default — and the generated skill tells the model
+to name the domain it needs rather than route around the allowlist.
+
+Search runs outside the sandbox for the same reason the flywheel runs in the gateway: a
+sidecar would share the gateway's netns, so SearXNG's own scraping would need the search
+engines themselves on your allowlist, MITM'd. Prefer not to self-host? Brave Search API or
+Tavily fit the credential broker cleanly — the key lives in the gateway, never in the
+container.
+
+## Flywheel (opt-in traffic capture)
+
+`./sandbox up --flywheel` makes the gateway record every LLM request/response — from any
+harness, against any backend, in one shape — into the sandbox's host-side control dir.
+That corpus is the *observe* step of the flywheel: fine-tune or evaluate a local model on
+the work you actually do, rather than on a public benchmark (plan §18).
+
+```bash
+./sandbox flywheel --name cc-repo stats
+./sandbox flywheel --name cc-repo export --format openai -o traces.jsonl
+```
+
+> **These records are not redacted.** Unlike the egress log, they contain full prompts and
+> completions — your source, tool output, anything the agent read. They stay on the host
+> (the workload cannot see them) and are gitignored, but treat the capture dir like the
+> source tree it mirrors. Request headers are never captured, so broker-injected
+> credentials never land in the corpus.
 
 ### Host ports (auto-assigned, per-sandbox-stable)
 

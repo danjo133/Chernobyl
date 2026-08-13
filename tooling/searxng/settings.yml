@@ -1,0 +1,37 @@
+# SearXNG settings for agent use. Overrides only what matters; everything else comes
+# from the image's defaults (`use_default_settings: true`).
+#
+# Three of these four are the classic "why does format=json 403/405 on a fresh install"
+# causes — see ./README.md.
+use_default_settings: true
+
+general:
+  instance_name: "sandbox-search"
+  # Nothing here should phone home or nag; this instance answers agents, not humans.
+  donation_url: false
+  enable_metrics: false
+
+server:
+  # Substituted by the image's entrypoint from $SEARXNG_SECRET.
+  secret_key: "ultrasecretkey"
+  # (1) The limiter/bot-detection plugin blocks non-browser clients — i.e. every agent.
+  #     Safe to disable ONLY because this instance is private (bind + reverse proxy auth).
+  limiter: false
+  public_instance: false
+  image_proxy: false
+  # (2) SearXNG defaults to POST for the search form, which makes
+  #     `GET /search?q=…&format=json` return 405. GET keeps the JSON API curl-able.
+  method: "GET"
+
+search:
+  # (3) JSON output is OFF by default — this is the single most common blocker.
+  formats:
+    - html
+    - json
+  safe_search: 0
+  autocomplete: ""
+  # Give slow engines room; agents care more about results than latency.
+  default_lang: "all"
+
+ui:
+  static_use_hash: true
