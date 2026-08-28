@@ -26,7 +26,7 @@ rationale in [`docs/SANDBOX-PLAN.md`](../docs/SANDBOX-PLAN.md).
 | `gateway/` | mitmproxy + iptables + redis broker (the firewall + credential boundary), plus the opt-in `flywheel_addon.py` LLM-traffic capture (plan §18) |
 | `fusefilter/` | host-side gitignore-driven filtered view (Go + go-fuse) |
 | `../broker/` | host-side credential filler (runs real OAuth, mints scoped handles) |
-| `../sandbox` | CLI: `up \| ls \| down \| open \| models \| flywheel` (worktrees, project naming, ports, harness/model selection) |
+| `../sandbox` | CLI: `up \| spawn \| reap \| ls \| down \| open \| models \| flywheel` (worktrees, project naming, ports, harness/model selection, lane policies, resource limits, TTLs) |
 
 ## Bring-up order (once Bash works) — maps to plan §14
 
@@ -61,6 +61,74 @@ skill to Minions yourself. See [plan §19](../docs/SANDBOX-PLAN.md).
 Each keeps its state in its own shared host home (`~/.claude`, `~/.pi`, `~/.omp`,
 `~/.prime` inside the container). Model/provider config is generated per launch from
 `--llm-backend`/`--model`; see [plan §17](../docs/SANDBOX-PLAN.md#17-harness-abstraction--swapping-the-agent-and-the-model).
+
+## Resource limits
+
+Every sandbox runs under a ceiling, so one runaway build cannot take the host with it:
+
+| service | cpus | memory | pids |
+|---|---|---|---|
+| `devcontainer` (workload) | `--cpus`, default 4 | `--memory`, default 8g | 2048 (fixed) |
+| `gateway` (firewall + broker) | 1 | 1g | — |
+
+```bash
+./sandbox up --source ~/dev/thing --cpus 2 --memory 4g
+```
+
+The values are written into `.env` as `SANDBOX_CPUS` / `SANDBOX_MEMORY` and applied with
+compose v2 `deploy.resources.limits`, which `docker compose` honours without swarm. The
+environment variables `SANDBOX_CPUS` and `SANDBOX_MEMORY` set your own defaults, and
+`./sandbox ls` shows what each sandbox got. Limits are read at `up`: change them by
+running `up` again.
+
+## Lane policies (`--policy FILE:LANE`)
+
+A lane policy file says what a class of agent runs may do. One lane of it becomes a
+sandbox's defaults:
+
+```bash
+./sandbox up --source ~/dev/thing --policy ~/dev/Omni/governance/policy/lanes.yaml:research
+```
+
+| lane key | becomes |
+|---|---|
+| `egress_allow` | allowlist entries, exactly as `--allow-url` would add them (`*.foo.com` globs included) |
+| `harness` | the default harness |
+| `llm_backend` | the default backend |
+| `sandbox.cpus` / `sandbox.memory` | the resource ceiling (from `defaults.sandbox`, or a lane-level override) |
+| `sandbox.max_minutes` | the wall-clock TTL — see below |
+
+An explicit flag always beats the file, so a policy is the floor you start from, not a
+door you cannot open. The sandbox records `SANDBOX_POLICY` and `SANDBOX_LANE` in `.env`
+and exports `OMNI_LANE` into the workload, so in-container tooling can see which rules
+apply. The file is read with `yq` when it is installed, and with `python3` + PyYAML
+otherwise; `--policy` fails with a clear message when neither is available.
+
+## Spawning and reaping (wall-clock TTL)
+
+`spawn` is the non-interactive path a scheduler uses: one `up` under a policy, then the
+command detached inside the workload (the `run -d` path). It prints `NAME RUN_ID`.
+
+```bash
+./sandbox spawn --source ~/dev/thing \
+  --policy ~/dev/Omni/governance/policy/lanes.yaml:research \
+  --ttl 45 -- ./task.sh          # --ttl defaults to the lane's sandbox.max_minutes
+```
+
+`reap` enforces the TTL. Run it from cron every 5 minutes:
+
+```cron
+*/5 * * * * /path/to/Chernobyl/sandbox reap
+```
+
+It brings down every sandbox whose `SANDBOX_STARTED_AT + SANDBOX_TTL_MINUTES` has
+passed, printing `reaped NAME (lane L, age Nm, ttl Tm)`. Use `--dry-run` to see what it
+would do. A sandbox with no TTL is never reaped unless you pass `--all`, which falls
+back to a 24h default. `./sandbox ls` shows each sandbox's lane, age, TTL and an
+`EXPIRED` marker once it is over.
+
+> The TTL clock starts at `up`, and re-running `up` on the same sandbox restarts it.
+> `--ttl 0` means no TTL.
 
 ## Workload toolchain
 

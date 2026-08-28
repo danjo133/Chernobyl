@@ -18,7 +18,16 @@
 #                [--allow-ip IP]...        add IP(s) to the egress allowlist
 #                [--allow-internet]        UNRESTRICTED egress (no allowlist, no MITM)
 #                [--allow-image-build]     seccomp=unconfined, so rootless podman/buildah can build images
-#   sandbox ls                          # sandboxes + harness/backend + broker UI / app / caido ports
+#                [--cpus N]                CPU limit for the workload (default 4; env SANDBOX_CPUS)
+#                [--memory SIZE]           memory limit for the workload (default 8g; env SANDBOX_MEMORY)
+#                [--policy FILE:LANE]      apply one lane of a policy file: egress allowlist,
+#                                          harness, backend, cpu/memory, TTL. Flags win over it.
+#                [--ttl MINUTES]           wall-clock lifetime (0 = none); `sandbox reap` enforces it.
+#                                          Pairs with [--run-id ID], the caller's id for this run.
+#   sandbox spawn --source PATH --policy FILE:LANE [--name NAME] [--ttl MINUTES] [--run-id ID] -- CMD...
+#                                       # non-interactive `up` + detached run, under a wall-clock TTL
+#   sandbox reap [--dry-run] [--all]    # tear down every sandbox past its TTL (cron: every 5 minutes)
+#   sandbox ls                          # sandboxes + harness/backend + lane/TTL + broker UI / app / caido ports
 #   sandbox allow [--name NAME] --url DOMAIN | --ip ADDR ...   # add egress entries LIVE (no restart)
 #   sandbox down [--name NAME]
 #   sandbox open [--name NAME] [--harness H] [--llm-backend B] [--model ID] [-- ARGS...]
@@ -35,14 +44,20 @@
 # Parallel sandboxes = different --name (and ideally different --worktree of a repo).
 # Every harness gets its own shared host-side home (SANDBOX_HOMES), so you log in once
 # per harness and every sandbox inherits it. Defaults can also come from the environment:
-# SANDBOX_HARNESS, SANDBOX_LLM_BACKEND, SANDBOX_LLM_URL, SANDBOX_MODEL.
+# SANDBOX_HARNESS, SANDBOX_LLM_BACKEND, SANDBOX_LLM_URL, SANDBOX_MODEL, SANDBOX_CPUS, SANDBOX_MEMORY.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF="$HERE/$(basename "${BASH_SOURCE[0]}")"   # re-entry point: `spawn` and `reap` drive the other verbs
 DC="$HERE/.devcontainer"
 COMPOSE=(docker compose -f "$DC/compose.yaml")
 WEBUI_PY="$HERE/broker/webui.py"
 WEB_PORT_DEFAULT=9999
+# Workload resource ceiling. A lane policy or --cpus/--memory overrides it per sandbox.
+SANDBOX_CPUS_DEFAULT="${SANDBOX_CPUS:-4}"
+SANDBOX_MEMORY_DEFAULT="${SANDBOX_MEMORY:-8g}"
+# `sandbox reap --all` also reaps sandboxes that never declared a TTL — after this long.
+REAP_DEFAULT_MINUTES="${SANDBOX_REAP_DEFAULT_MINUTES:-1440}"
 
 # Shared, per-user (NOT per-sandbox) harness homes: auth + settings + agents/skills +
 # session logs, bind-mounted into every sandbox. Login once; every sandbox inherits it.
@@ -71,6 +86,121 @@ HARNESS_LIB_DIR="$DC/harness"
 state_dir() { echo "$DC/.broker-control-$1"; }
 state_set() { mkdir -p "$(state_dir "$1")"; printf '%s\n' "$3" > "$(state_dir "$1")/$2"; }
 state_get() { local f; f="$(state_dir "$1")/$2"; [ -f "$f" ] && cat "$f" || true; }
+state_clear() { rm -f "$(state_dir "$1")/$2"; }
+
+# Compose project names must be [a-z0-9][a-z0-9_-]*: lowercase, strip trailing '-'
+# (tr -c also mangles the trailing newline into one). `up` and `spawn` must derive
+# the SAME default name from a source path, or spawn would drive the wrong sandbox.
+default_name() { echo "cc-$(basename "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '-' | sed 's/-*$//')"; }
+
+# --- lane policy (--policy FILE:LANE) ----------------------------------------
+# One lane of a policy file (Omni's governance/policy/lanes.yaml shape) becomes this
+# sandbox's defaults: egress_allow -> allowlist entries, harness/llm_backend -> the
+# agent, defaults.sandbox.cpus/memory/max_minutes (lane-level overrides win) -> the
+# resource ceiling and the wall-clock TTL. An explicit CLI flag always beats the file.
+# Read with yq when installed, else python3 + PyYAML; the two engines must agree, so
+# every query is a plain scalar/list lookup that both dialects spell the same way.
+YAML_ENGINE=""
+yaml_engine_init() {
+  [ -n "$YAML_ENGINE" ] && return 0
+  if command -v yq >/dev/null 2>&1; then
+    # mikefarah's yq (Go) prints scalars raw and rejects -r; kislyuk's wraps jq and needs it.
+    if yq --version 2>&1 | grep -qi mikefarah; then YAML_ENGINE=yq-go; else YAML_ENGINE=yq-jq; fi
+  elif python3 -c 'import yaml' 2>/dev/null; then
+    YAML_ENGINE=python
+  else
+    die "--policy needs a YAML reader: install yq, or PyYAML for python3 (pip install pyyaml)"
+  fi
+}
+
+# KIND is one of:  lanes (every lane name) | lane KEY (lanes.LANE.KEY)
+#                | sandbox KEY (lanes.LANE.sandbox.KEY, else defaults.sandbox.KEY)
+#                | egress (lanes.LANE.egress_allow[], one per line)
+policy_query() {  # FILE LANE KIND [KEY]
+  local file="$1" lane="$2" kind="$3" key="${4:-}" expr
+  case "$YAML_ENGINE" in
+    yq-go|yq-jq)
+      case "$kind" in
+        lanes)   expr='.lanes | keys | .[]' ;;
+        lane)    expr=".lanes[\"$lane\"].$key // \"\"" ;;
+        sandbox) expr=".lanes[\"$lane\"].sandbox.$key // .defaults.sandbox.$key // \"\"" ;;
+        egress)  expr="(.lanes[\"$lane\"].egress_allow // []) | .[]" ;;
+        *) die "policy_query: unknown kind '$kind'" ;;
+      esac
+      if [ "$YAML_ENGINE" = yq-jq ]; then yq -r "$expr" "$file"; else yq "$expr" "$file"; fi
+      ;;
+    *) policy_query_py "$file" "$lane" "$kind" "$key" ;;
+  esac
+}
+
+policy_query_py() {  # FILE LANE KIND KEY
+  python3 - "$@" <<'PYEOF'
+import sys, yaml
+file, lane, kind, key = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+doc = yaml.safe_load(open(file)) or {}
+lanes = doc.get("lanes") or {}
+if kind == "lanes":
+    for k in lanes:
+        print(k)
+    raise SystemExit(0)
+ln = lanes.get(lane) or {}
+if kind == "egress":
+    for e in ln.get("egress_allow") or []:
+        print(e)
+    raise SystemExit(0)
+if kind == "lane":
+    v = ln.get(key)
+elif kind == "sandbox":
+    v = (ln.get("sandbox") or {}).get(key)
+    if v is None:
+        v = ((doc.get("defaults") or {}).get("sandbox") or {}).get(key)
+else:
+    raise SystemExit("policy_query: unknown kind %r" % kind)
+if v is not None:
+    print(v)
+PYEOF
+}
+
+# A missing key reads back as an empty string, a YAML null or a quoted empty scalar
+# depending on the engine — and a glob entry may come back quoted. Normalise here so
+# the callers can compare against "" and feed the allowlist verbatim.
+policy_unquote() {
+  local v="$1"
+  case "$v" in
+    null|'~') v="" ;;
+    "'"*"'") v="${v#\'}"; v="${v%\'}" ;;
+    '"'*'"') v="${v#\"}"; v="${v%\"}" ;;
+  esac
+  printf '%s\n' "$v"
+}
+policy_get() { policy_unquote "$(policy_query "$@")"; }
+
+# Sets POLICY_FILE/POLICY_LANE/POLICY_HARNESS/POLICY_BACKEND/POLICY_CPUS/POLICY_MEMORY/
+# POLICY_MAX_MINUTES/POLICY_EGRESS from a FILE:LANE spec. Dies on anything unreadable —
+# a sandbox brought up under the wrong rules is worse than one that never started.
+policy_load() {  # FILE:LANE
+  local spec="$1" e
+  POLICY_FILE="${spec%:*}"; POLICY_LANE="${spec##*:}"
+  [ "$POLICY_FILE" != "$spec" ] && [ -n "$POLICY_FILE" ] && [ -n "$POLICY_LANE" ] \
+    || die "--policy wants FILE:LANE (e.g. governance/policy/lanes.yaml:research)"
+  [ -f "$POLICY_FILE" ] || die "--policy: no such file '$POLICY_FILE'"
+  # The lane name is interpolated into a yq expression — keep it boring.
+  case "$POLICY_LANE" in *[!A-Za-z0-9_-]*) die "--policy: bad lane name '$POLICY_LANE'";; esac
+  yaml_engine_init
+  policy_query "$POLICY_FILE" "$POLICY_LANE" lanes | grep -qxF "$POLICY_LANE" \
+    || die "--policy: no lane '$POLICY_LANE' in $POLICY_FILE (have: $(policy_query "$POLICY_FILE" "" lanes | tr '\n' ' '))"
+  POLICY_HARNESS="$(policy_get "$POLICY_FILE" "$POLICY_LANE" lane harness)"
+  POLICY_BACKEND="$(policy_get "$POLICY_FILE" "$POLICY_LANE" lane llm_backend)"
+  POLICY_CPUS="$(policy_get "$POLICY_FILE" "$POLICY_LANE" sandbox cpus)"
+  POLICY_MEMORY="$(policy_get "$POLICY_FILE" "$POLICY_LANE" sandbox memory)"
+  POLICY_MAX_MINUTES="$(policy_get "$POLICY_FILE" "$POLICY_LANE" sandbox max_minutes)"
+  POLICY_EGRESS=""
+  while IFS= read -r e; do
+    e="$(policy_unquote "$e")"
+    [ -n "$e" ] || continue
+    POLICY_EGRESS="$POLICY_EGRESS $e"
+  done < <(policy_query "$POLICY_FILE" "$POLICY_LANE" egress)
+}
 
 # Every harness's shared host home, exported for EVERY compose invocation — compose.yaml
 # requires all of them. Doing it here rather than only writing them into .env at `up` is
@@ -235,14 +365,17 @@ case "$cmd" in
     LLM_URL="${SANDBOX_LLM_URL:-}"; MODEL="${SANDBOX_MODEL:-}"; SMALL_MODEL="${SANDBOX_SMALL_MODEL:-}"
     FLYWHEEL=0; LLM_ANTHROPIC="${SANDBOX_LLM_ANTHROPIC:-0}"
     SEARCH_URL="${SANDBOX_SEARCH_URL:-}"
+    # Empty = "not given on the command line", so a --policy can fill it in below.
+    POLICY=""; LANE=""; CPUS=""; MEMORY=""; TTL=""; RUN_ID=""
+    HARNESS_SET=0; BACKEND_SET=0
     while [ $# -gt 0 ]; do case "$1" in
       --source) SOURCE="$2"; shift 2;;
       --name) NAME="$2"; shift 2;;
       --worktree) WORKTREE="$2"; shift 2;;
       --port) PORT="$2"; shift 2;;
       --web-port) WEB_PORT="$2"; shift 2;;
-      --harness) HARNESS="$2"; shift 2;;
-      --llm-backend|--backend) BACKEND="$2"; shift 2;;
+      --harness) HARNESS="$2"; HARNESS_SET=1; shift 2;;
+      --llm-backend|--backend) BACKEND="$2"; BACKEND_SET=1; shift 2;;
       --llm-url) LLM_URL="$2"; shift 2;;
       --model) MODEL="$2"; shift 2;;
       --small-model) SMALL_MODEL="$2"; shift 2;;
@@ -260,10 +393,37 @@ case "$cmd" in
       --allow-url) ALLOW_EXTRA="$ALLOW_EXTRA $2"; shift 2;;
       --allow-ip)  ALLOW_EXTRA="$ALLOW_EXTRA $2"; shift 2;;
       --allow-image-build|--disable-seccomp) ALLOW_IMAGE_BUILD=1; shift;;
+      --cpus) CPUS="$2"; shift 2;;
+      --memory) MEMORY="$2"; shift 2;;
+      --policy) POLICY="$2"; shift 2;;
+      --ttl) TTL="$2"; shift 2;;          # wall-clock minutes; `sandbox reap` enforces it
+      --run-id) RUN_ID="$2"; shift 2;;    # caller's id for this run (set by `spawn`)
       *) die "unknown arg $1";;
     esac; done
     [ -n "$SOURCE" ] || die "--source is required"
     SOURCE="$(cd "$SOURCE" && pwd)"
+
+    # A lane policy supplies what the command line left out: the agent, the egress it
+    # may use, its resource ceiling and how long it may live. Explicit flags still win,
+    # so a policy is the floor you start from, not a door you cannot open. See §20.
+    if [ -n "$POLICY" ]; then
+      policy_load "$POLICY"
+      LANE="$POLICY_LANE"
+      [ "$HARNESS_SET" = 1 ] || [ -z "$POLICY_HARNESS" ] || HARNESS="$POLICY_HARNESS"
+      [ "$BACKEND_SET" = 1 ] || [ -z "$POLICY_BACKEND" ] || BACKEND="$POLICY_BACKEND"
+      [ -n "$CPUS" ]   || CPUS="$POLICY_CPUS"
+      [ -n "$MEMORY" ] || MEMORY="$POLICY_MEMORY"
+      [ -n "$TTL" ]    || TTL="$POLICY_MAX_MINUTES"
+      ALLOW_EXTRA="$ALLOW_EXTRA $POLICY_EGRESS"
+    fi
+
+    # Resource ceiling and lifetime. `--ttl 0` (or neither policy nor flag) means no
+    # TTL: `sandbox reap` then leaves this sandbox alone unless it is given --all.
+    CPUS="${CPUS:-$SANDBOX_CPUS_DEFAULT}"
+    MEMORY="${MEMORY:-$SANDBOX_MEMORY_DEFAULT}"
+    case "$CPUS" in ''|*[!0-9.]*) die "--cpus wants a number of cores (got '$CPUS')";; esac
+    case "$MEMORY" in ''|*[!0-9bkmgBKMG]*) die "--memory wants a size like 8g or 512m (got '$MEMORY')";; esac
+    case "$TTL" in ''|0) TTL="";; *[!0-9]*) die "--ttl wants whole minutes (got '$TTL')";; esac
 
     # Resolve harness + backend up front: both contribute egress allowlist entries, and
     # a typo here should fail before anything is built.
@@ -306,9 +466,7 @@ case "$cmd" in
       SOURCE="$(cd "$WT_DIR" && pwd)"
     fi
 
-    # Compose project names must be [a-z0-9][a-z0-9_-]*: lowercase, strip trailing '-'
-    # (tr -c also mangles the trailing newline into one).
-    NAME="${NAME:-cc-$(basename "$SOURCE" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '-' | sed 's/-*$//')}"
+    NAME="${NAME:-$(default_name "$SOURCE")}"
     MOUNT="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/devfilter/$NAME"
 
     setup_claude_home
@@ -323,9 +481,15 @@ case "$cmd" in
       cp "$DC/gateway/allowed-domains.txt" "$ALLOWLIST_FILE"
       printf '\n# --- per-sandbox additions (%s) ---\n' "$NAME" >> "$ALLOWLIST_FILE"
     fi
+    # Entries may be globs (`*.foo.com`, which the gateway matches with fnmatch), so
+    # pathname expansion has to be off while the unquoted list is split into words.
+    set -f
     for h in $ALLOW_EXTRA; do grep -qxF "$h" "$ALLOWLIST_FILE" || echo "$h" >> "$ALLOWLIST_FILE"; done
+    set +f
 
-    # Write the env compose + mount.sh consume.
+    # Write the env compose + mount.sh consume. The TTL clock starts here: a re-`up`
+    # of the same sandbox is a fresh run and gets its full lifetime again.
+    STARTED_AT="$(date +%s)"
     cat > "$DC/.env" <<EOF
 SANDBOX_NAME=$NAME
 SANDBOX_SOURCE=$SOURCE
@@ -336,6 +500,13 @@ MINIONS_DIR=$MINIONS_DIR
 ALLOW_INTERNET=$ALLOW_INTERNET
 ALLOWLIST_FILE=$ALLOWLIST_FILE
 FLYWHEEL=$FLYWHEEL
+SANDBOX_CPUS=$CPUS
+SANDBOX_MEMORY=$MEMORY
+SANDBOX_POLICY=$POLICY
+SANDBOX_LANE=$LANE
+SANDBOX_STARTED_AT=$STARTED_AT
+SANDBOX_TTL_MINUTES=$TTL
+SANDBOX_RUN_ID=$RUN_ID
 EOF
     harness_home_env_lines >> "$DC/.env"   # SANDBOX_CLAUDE_HOME / _PI_ / _OMP_ / _PRIME_HOME
     mkdir -p "$DC/.broker-control-$NAME"
@@ -351,6 +522,15 @@ EOF
     state_set "$NAME" llm-anthropic "$LLM_ANTHROPIC"
     state_set "$NAME" search-url "$SEARCH_URL"
     state_set "$NAME" flywheel "$FLYWHEEL"
+    # Limits, policy and lifetime also live here, not only in the env file: `reap` and
+    # `ls` walk every sandbox at once, and that file only describes the last one up.
+    state_set "$NAME" cpus "$CPUS"
+    state_set "$NAME" memory "$MEMORY"
+    state_set "$NAME" policy "$POLICY"
+    state_set "$NAME" lane "$LANE"
+    state_set "$NAME" started-at "$STARTED_AT"
+    state_set "$NAME" ttl-minutes "$TTL"
+    state_set "$NAME" run-id "$RUN_ID"
 
     # App port forward: an explicit --port HOST:CTR is honoured verbatim; otherwise
     # auto-assign a free host port (3000+, stable per sandbox) -> container :3000,
@@ -419,6 +599,8 @@ EOF
     webui_start "$NAME" "$DC/.broker-control-$NAME" "$WEB_PORT"
     echo "sandbox: '$NAME' up. Open with:  ./sandbox open --name $NAME"
     echo "sandbox: harness   $HARNESS -> $BACKEND${MODEL:+ ($MODEL)}  [$B_URL]"
+    [ -z "$POLICY" ] || echo "sandbox: policy   $POLICY -> lane $LANE, egress +${POLICY_EGRESS}"
+    echo "sandbox: limits   $CPUS cpus, $MEMORY memory, 2048 pids${TTL:+, ttl ${TTL}m (sandbox reap enforces it)}"
     if [ -n "$SEARCH_URL" ]; then
       echo "sandbox: search    $SEARCH_URL  ('websearch' in-container; omp uses it natively)"
     fi
@@ -432,6 +614,79 @@ EOF
       echo "sandbox: NOTE — $HARNESS + anthropic expects the real key to come from the broker" >&2
       echo "sandbox:        (set it for api.anthropic.com in the broker UI) or from '/login' inside the sandbox." >&2
     fi
+    ;;
+
+  spawn)
+    # The scheduler's entry point: one non-interactive `up` under a lane policy, then
+    # the command detached inside the workload. What the sandbox may do comes from the
+    # policy; when it dies comes from the TTL that `sandbox reap` enforces. See §20.
+    SOURCE=""; NAME=""; POLICY=""; TTL=""; RUN_ID=""; CMD=""
+    while [ $# -gt 0 ]; do case "$1" in
+      --source) SOURCE="$2"; shift 2;;
+      --name) NAME="$2"; shift 2;;
+      --policy) POLICY="$2"; shift 2;;
+      --ttl) TTL="$2"; shift 2;;
+      --run-id) RUN_ID="$2"; shift 2;;
+      --) shift; CMD="$*"; break;;
+      *) die "unknown arg $1";;
+    esac; done
+    [ -n "$SOURCE" ] || die "--source is required"
+    [ -n "$POLICY" ] || die "--policy FILE:LANE is required (spawn is the governed path; for an ad-hoc run use 'up' then 'run -d')"
+    [ -n "$CMD" ]    || die "give the command after '--' (e.g. spawn --source . --policy lanes.yaml:research -- ./task.sh)"
+    SOURCE="$(cd "$SOURCE" && pwd)"
+    [ -n "$NAME" ] || NAME="$(default_name "$SOURCE")"
+    # One id per run, so logs, the ledger and this sandbox can be tied together later.
+    [ -n "$RUN_ID" ] || RUN_ID="run-$(date -u +%Y%m%dT%H%M%SZ)-$(python3 -c 'import secrets;print(secrets.token_hex(3))')"
+
+    UP=("$SELF" up --source "$SOURCE" --name "$NAME" --policy "$POLICY" --run-id "$RUN_ID")
+    [ -z "$TTL" ] || UP+=(--ttl "$TTL")
+    "${UP[@]}"
+    "$SELF" run --name "$NAME" -d -- "$CMD"
+
+    TTL="$(state_get "$NAME" ttl-minutes)"      # `up` resolved it (flag, else the policy)
+    echo "sandbox: spawned '$NAME' run $RUN_ID${TTL:+ (ttl ${TTL}m)}" >&2
+    printf '%s %s\n' "$NAME" "$RUN_ID"
+    ;;
+
+  reap)
+    # Wall-clock enforcement, meant for cron every 5 minutes. A sandbox is torn down
+    # once started-at + ttl has passed. No TTL recorded = never reaped, unless --all,
+    # which falls back to a global 24h. Idempotent: the lifetime state is cleared after
+    # a successful `down`, so a reaped sandbox is not reported again.
+    DRY=0; ALL=0
+    while [ $# -gt 0 ]; do case "$1" in
+      --dry-run|-n) DRY=1; shift;;
+      --all) ALL=1; shift;;
+      *) die "unknown arg $1";;
+    esac; done
+    NOW="$(date +%s)"
+    shopt -s nullglob
+    for ctrl in "$DC"/.broker-control-*/; do
+      name="$(basename "$ctrl")"; name="${name#.broker-control-}"
+      started="$(cat "$ctrl/started-at" 2>/dev/null || true)"
+      [ -n "$started" ] || continue                 # never brought up by a version that records it
+      ttl="$(cat "$ctrl/ttl-minutes" 2>/dev/null || true)"
+      if [ -z "$ttl" ]; then
+        [ "$ALL" = 1 ] || continue
+        ttl="$REAP_DEFAULT_MINUTES"
+      fi
+      [ "$NOW" -gt "$((started + ttl * 60))" ] || continue
+      lane="$(cat "$ctrl/lane" 2>/dev/null || true)"
+      age="$(((NOW - started) / 60))"
+      if [ "$DRY" = 1 ]; then
+        echo "would reap $name (lane ${lane:-none}, age ${age}m, ttl ${ttl}m)"
+        continue
+      fi
+      # Keep the lifetime state on failure, so the next run tries again rather than
+      # silently leaving an over-age sandbox running.
+      if ! "$SELF" down --name "$name" >/dev/null; then
+        echo "sandbox: reap: 'down' failed for '$name' — leaving it for the next run" >&2
+        continue
+      fi
+      state_clear "$name" started-at
+      state_clear "$name" ttl-minutes
+      echo "reaped $name (lane ${lane:-none}, age ${age}m, ttl ${ttl}m)"
+    done
     ;;
 
   ls)
@@ -457,6 +712,20 @@ EOF
           "$( [ "$(cat "$ctrl/flywheel" 2>/dev/null)" = 1 ] && printf '  [flywheel]' )"
         [ -s "$ctrl/search-url" ] && printf "  %-22s search -> %s\n" "" "$(cat "$ctrl/search-url")"
       fi
+      # Lane policy + how much of its wall-clock lifetime this sandbox has used.
+      lane="$(cat "$ctrl/lane" 2>/dev/null || true)"
+      started="$(cat "$ctrl/started-at" 2>/dev/null || true)"
+      ttl="$(cat "$ctrl/ttl-minutes" 2>/dev/null || true)"
+      if [ -n "$lane$started$ttl" ]; then
+        now="$(date +%s)"; age="?"; expired=""; ttl_shown="none"
+        [ -z "$started" ] || age="$(((now - started) / 60))m"
+        [ -z "$ttl" ] || ttl_shown="${ttl}m"
+        if [ -n "$started" ] && [ -n "$ttl" ] && [ "$now" -gt "$((started + ttl * 60))" ]; then expired="  EXPIRED"; fi
+        printf "  %-22s lane  -> %-10s age %-6s ttl %s%s\n" "" "${lane:-none}" "$age" "$ttl_shown" "$expired"
+      fi
+      if [ -s "$ctrl/cpus" ]; then
+        printf "  %-22s limits-> %s cpus, %s memory\n" "" "$(cat "$ctrl/cpus")" "$(cat "$ctrl/memory" 2>/dev/null || echo '?')"
+      fi
       # Secondary lines: app forward + Caido workbench, when assigned for this sandbox.
       [ -f "$ctrl/app-port" ]   && printf "  %-22s app   -> http://127.0.0.1:%s (container :3000)\n" "" "$(cat "$ctrl/app-port")"
       [ -f "$ctrl/caido-port" ] && printf "  %-22s caido -> http://127.0.0.1:%s\n" "" "$(cat "$ctrl/caido-port")"
@@ -478,10 +747,12 @@ EOF
     [ -n "$EXTRA" ] || die "give at least one --url DOMAIN or --ip ADDR"
     AF="$DC/.allowlist-$NAME.txt"
     [ -f "$AF" ] || die "no allowlist for '$NAME' (is it up? run: ./sandbox up ...)"
+    set -f      # `*.foo.com` is a valid entry — do not let the shell expand it
     for h in $EXTRA; do
       if grep -qxF "$h" "$AF"; then echo "sandbox: $h already allowed";
       else echo "$h" >> "$AF"; echo "sandbox: + $h"; fi
     done
+    set +f
     echo "sandbox: allowlist hot-reloaded (no restart; broker applies it on the next request)."
     ;;
 
@@ -762,6 +1033,6 @@ EOF
     ;;
 
   *)
-    sed -n '2,36p' "$0"
+    sed -n '2,47p' "$0"
     ;;
 esac

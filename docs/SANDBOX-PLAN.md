@@ -840,3 +840,42 @@ workload) — the cost is money and a cloud dependency, so they stay a documente
 rather than the default. omp's keyless engines (DuckDuckGo, Startpage, Ecosia, Google,
 Mojeek) work with no infrastructure at all, but only for omp, and only by allowlisting
 those engines directly — the sidecar problem again, minus the sidecar.
+
+## 20. Budget — resource limits, lane policies, and a wall-clock TTL
+
+The gateway answers *where the agent may reach*. It says nothing about *how much of the
+host it may burn* or *how long it may run*. Three additions close that gap, all of them
+per-sandbox and all of them enforced outside the workload.
+
+**Resource limits.** The workload gets `--cpus` (default 4) and `--memory` (default 8g),
+and a fixed pid ceiling of 2048; the gateway gets a fixed 1 cpu / 1g, because it only
+proxies and a runaway workload must not be able to starve the firewall that contains it.
+These are compose v2 `deploy.resources.limits`, which `docker compose` applies without
+swarm. They are not a security boundary — a container under a cgroup limit is still a
+container — but they turn "one sandbox wedged the machine" into "one sandbox got slow",
+which is the failure mode that actually happens with agents that run `make -j` or fork.
+
+**Lane policies.** `--policy FILE:LANE` reads one lane of a policy file (Omni's
+`governance/policy/lanes.yaml` shape) and uses it as this sandbox's defaults: its
+`egress_allow` list becomes allowlist entries, `harness`/`llm_backend` choose the agent,
+and `defaults.sandbox.cpus/memory/max_minutes` (with lane-level overrides) set the
+ceiling and the lifetime. The point is that the rules for a class of run live in one
+reviewed, CODEOWNER'd file rather than in whatever flags the caller remembered. Explicit
+flags still win, so the policy is a floor to work from, not a cage — the file is a
+default-setter on the host CLI, not an enforcement point inside the sandbox, and
+`OMNI_LANE` is exported into the workload only so in-container tooling can *see* which
+lane it is in. Anything that must actually be enforced belongs in the gateway.
+
+**Wall-clock TTL.** An agent that hangs costs money for as long as nobody looks. `spawn`
+is the non-interactive entry point — one `up` under a policy, then the command detached
+in the workload — and it records `SANDBOX_STARTED_AT`, `SANDBOX_TTL_MINUTES` and a
+`SANDBOX_RUN_ID`. `reap` (cron, every 5 minutes) brings down everything past its TTL.
+Deliberately a poll from outside rather than a timer inside: a workload that can kill its
+own deadline has no deadline. Sandboxes with no recorded TTL are never touched unless
+`reap --all` is used, so an interactive session is not swept away by the cron that exists
+to catch runaway batch runs.
+
+**Where the state lives.** `.devcontainer/.env` is last-writer-wins across parallel
+sandboxes (§11), so the durable copy of the limits, lane and lifetime is the per-sandbox
+control dir, exactly as harness/model selection already is. `ls` and `reap` both walk
+those dirs, which is why they can report on every sandbox at once and `.env` cannot.
