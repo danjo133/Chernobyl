@@ -176,7 +176,10 @@ class Flywheel:
             os.makedirs(CAPTURE_DIR, exist_ok=True)
             os.chmod(CAPTURE_DIR, 0o777)  # same rationale as /run/broker-control
         except OSError as e:
-            log.error("flywheel: cannot create %s (%s) — capture disabled", CAPTURE_DIR, e)
+            # WARNING, not ERROR, on purpose: mitmproxy's ErrorCheck addon aborts the whole
+            # proxy if anything logs at ERROR during startup. An unusable capture dir must
+            # degrade to "no captures", never take egress (and with it the sandbox) down.
+            log.warning("flywheel: cannot create %s (%s) — capture disabled", CAPTURE_DIR, e)
             self.enabled = False
             return
         log.info("flywheel: capturing LLM traffic -> %s", CAPTURE_DIR)

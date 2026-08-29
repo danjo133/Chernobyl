@@ -62,11 +62,17 @@ set_provider_model_args() {
     if [ -n "${SANDBOX_MODEL_CONTEXT:-}" ]; then
       PROVIDER_ARGS+=(--context "$SANDBOX_MODEL=$SANDBOX_MODEL_CONTEXT")
     fi
+    if [ -n "${SANDBOX_MODEL_INPUT:-}" ]; then
+      PROVIDER_ARGS+=(--input "$SANDBOX_MODEL=$SANDBOX_MODEL_INPUT")
+    fi
   fi
   if [ -n "${SANDBOX_SMALL_MODEL:-}" ] && [ "${SANDBOX_SMALL_MODEL:-}" != "${SANDBOX_MODEL:-}" ]; then
     PROVIDER_ARGS+=(--model "$SANDBOX_SMALL_MODEL")
     if [ -n "${SANDBOX_SMALL_MODEL_CONTEXT:-}" ]; then
       PROVIDER_ARGS+=(--context "$SANDBOX_SMALL_MODEL=$SANDBOX_SMALL_MODEL_CONTEXT")
+    fi
+    if [ -n "${SANDBOX_SMALL_MODEL_INPUT:-}" ]; then
+      PROVIDER_ARGS+=(--input "$SANDBOX_SMALL_MODEL=$SANDBOX_SMALL_MODEL_INPUT")
     fi
   fi
   return 0

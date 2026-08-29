@@ -184,6 +184,29 @@ set (`.claude`, `node_modules`, `.venv`, `target`, `dist`) is always force-shown
 `.kube`, `.docker`, …) ALWAYS wins — listing a secret here can never expose it. Writes to
 force-shown paths pass through to the host source dir (still git-ignored, so never committed).
 
+## Host user is not uid 1000 (`--fs-uid` / `--fs-gid`)
+
+The workload container runs as uid 1000 (`node`). The FUSE filter therefore **reports**
+uid/gid 1000 for every file by default, so the agent can write a repo that belongs to a
+host user with a different uid. Without it, git, node and editors `stat()` the file, see
+an owner they are not, and refuse to write.
+
+Only the view lies. The filter daemon still performs the real reads and writes as the
+invoking host user, so files land on disk owned by that user and stay usable outside the
+sandbox. The mount deliberately omits `default_permissions`, so the kernel delegates
+access checks to the daemon instead of testing the reported owner.
+
+Override it per sandbox, or turn it off:
+
+```
+sandbox up --source ~/dev/myrepo --fs-uid 1000 --fs-gid 1000   # default
+sandbox up --source ~/dev/myrepo --fs-uid 0 --fs-gid 0         # report the real owner
+```
+
+`up` persists `SANDBOX_FS_UID`/`SANDBOX_FS_GID` into the per-sandbox env file, so later
+`open`/`run` calls remount the same way. Both must be `0`, or both non-zero. The same two
+environment variables work for the VS Code `initializeCommand` path, which has no CLI.
+
 ## Two rules to remember
 
 - **A sandbox is a unit:** gateway + workload (+ any dev-dep containers) share one netns;
