@@ -936,7 +936,10 @@ lane it is in. Anything that must actually be enforced belongs in the gateway.
 **Wall-clock TTL.** An agent that hangs costs money for as long as nobody looks. `spawn`
 is the non-interactive entry point — one `up` under a policy, then the command detached
 in the workload — and it records `SANDBOX_STARTED_AT`, `SANDBOX_TTL_MINUTES` and a
-`SANDBOX_RUN_ID`. `reap` (cron, every 5 minutes) brings down everything past its TTL.
+`SANDBOX_RUN_ID`. `reap` (a systemd user timer or cron, every 5 minutes — see
+`tooling/systemd/`) brings down everything past its TTL. It must run **as the user that
+owns the sandboxes**: state is per-user (§10.1), so a root-level job finds an empty
+state dir and reaps nothing without erroring.
 Deliberately a poll from outside rather than a timer inside: a workload that can kill its
 own deadline has no deadline. Sandboxes with no recorded TTL are never touched unless
 `reap --all` is used, so an interactive session is not swept away by the cron that exists

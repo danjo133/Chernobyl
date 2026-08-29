@@ -1,0 +1,21 @@
+[Unit]
+Description=Reap agent sandboxes past their TTL
+Documentation=https://github.com/danjo133/Chernobyl
+
+[Service]
+Type=oneshot
+# Absolute path on purpose: a systemd user unit does NOT inherit your shell's PATH,
+# so ~/.local/bin is not on it even when your interactive shell has it. %h is $HOME.
+ExecStart=%h/.local/bin/sandbox reap
+
+# `reap` reads per-user state under $XDG_STATE_HOME and drives docker. Both are
+# resolved from the environment, so this unit must run as the user that OWNS the
+# sandboxes — which a user unit does by construction. A system-level job running as
+# root would walk root's (empty) state dir and reap nothing.
+
+# Rootless docker: the daemon socket lives in the user runtime dir. Harmless on
+# rootful docker, where the client falls back to /var/run/docker.sock.
+Environment=DOCKER_HOST=unix://%t/docker.sock
+
+# Never let a wedged teardown pile up runs on a 5-minute timer.
+TimeoutStartSec=10min

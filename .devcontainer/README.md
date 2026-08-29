@@ -115,11 +115,20 @@ command detached inside the workload (the `run -d` path). It prints `NAME RUN_ID
   --ttl 45 -- ./task.sh          # --ttl defaults to the lane's sandbox.max_minutes
 ```
 
-`reap` enforces the TTL. Run it from cron every 5 minutes:
+`reap` enforces the TTL — schedule it every 5 minutes. **It must run as the user that
+owns the sandboxes:** state is per-user, so a root-level job walks root's state dir and
+reaps nothing, silently. A systemd *user* timer gets this right by construction, and is
+the only option on a stock NixOS (no cron installed):
 
-```cron
-*/5 * * * * /path/to/Chernobyl/sandbox reap
+```bash
+cp ../tooling/systemd/sandbox-reap.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now sandbox-reap.timer
+sudo loginctl enable-linger "$USER"     # needed for an account that is not logged in
 ```
+
+Ready-made units, a NixOS module snippet and the cron equivalent (including the
+`DOCKER_HOST` caveat under rootless docker) are in
+[`tooling/systemd/`](../tooling/systemd/README.md).
 
 It brings down every sandbox whose `SANDBOX_STARTED_AT + SANDBOX_TTL_MINUTES` has
 passed, printing `reaped NAME (lane L, age Nm, ttl Tm)`. Use `--dry-run` to see what it

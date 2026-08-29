@@ -67,6 +67,7 @@ service:gateway` (firewall outside the workload's reach) and the gateway-as-brok
 | `.devcontainer/tools/` | bb-hunter sidecar image (opt-in `--tools`): recon/scanning tooling Claude drives over SSH, egress contained through the gateway |
 | [`broker/`](broker/) | host-side credential broker: `webui.py` (password-gated web app) + `fill.py` (CLI filler) that run real OAuth and mint scoped handles, plus `flywheel.py` (read/export captured LLM traffic). See its [README](broker/README.md). |
 | [`tooling/`](tooling/) | standalone bug-bounty tooling (bb-hunter image, scope guard, MCP/LiteLLM helpers) — usable outside a sandbox too |
+| [`tooling/systemd/`](tooling/systemd/README.md) | ready-made user timer for `sandbox reap` (TTL enforcement), plus NixOS and cron equivalents |
 | [`tooling/searxng/`](tooling/searxng/) | deploy-it-yourself SearXNG (compose + settings) that gives every harness web search through one allowlisted host — runs **outside** the sandbox, see its [README](tooling/searxng/README.md) |
 | [`install.sh`](install.sh) / [`Makefile`](Makefile) | installer: checks host prerequisites, builds the FUSE filter, puts `sandbox` on your `PATH` |
 | [`docs/SANDBOX-PLAN.md`](docs/SANDBOX-PLAN.md) | full design, threat model, phased plan |

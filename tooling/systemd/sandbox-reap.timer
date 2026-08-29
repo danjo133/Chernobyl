@@ -1,0 +1,16 @@
+[Unit]
+Description=Reap agent sandboxes past their TTL, every 5 minutes
+Documentation=https://github.com/danjo133/Chernobyl
+
+[Timer]
+# The systemd spelling of `*/5 * * * *`.
+OnCalendar=*:0/5
+# Catch up on a run missed while the machine was off, so a sandbox that expired
+# overnight is torn down at boot rather than lingering until the next tick.
+Persistent=true
+# A reaper does not need second precision; letting systemd coalesce this with other
+# timers keeps it off its own wakeup.
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
