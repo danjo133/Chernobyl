@@ -331,14 +331,17 @@ splits them by consequence: a missing *required* tool means no sandbox can come 
 missing optional one only disables a feature (`--worktree` needs git, `--policy` needs
 yq or PyYAML). See §10.1 for what installing puts where.
 
-> **Current blocker — Bash is non-functional in this Claude Code session.** Every
-> command returns `bwrap: Can't create file at /run/wrappers/bin: No such file or
-> directory` — Claude Code's own bubblewrap command-sandbox failing to initialize on
-> NixOS. File writes work; building images, mounting FUSE, and running tests do not,
-> until resolved. Likely fixes: ensure `/run/wrappers/bin` exists (NixOS setuid
-> wrapper path — a missing one suggests an incomplete activation or running outside a
-> proper NixOS session), or disable Claude Code's bash sandbox (`/sandbox`, or the
-> sandbox setting) so commands run unwrapped.
+> **NixOS caveat — Claude Code's own bash sandbox.** When *driving* this tool from a
+> Claude Code session on a NixOS host, bubblewrap may fail to initialize: every command
+> returns `bwrap: Can't create file at /run/wrappers/bin: No such file or directory`.
+> File writes still work, but building images, mounting FUSE and running tests do not.
+> Fixes: ensure `/run/wrappers/bin` exists (the NixOS setuid wrapper path — a missing
+> one suggests an incomplete activation or a session started outside a proper NixOS
+> environment), or disable Claude Code's bash sandbox (`/sandbox`, or the sandbox
+> setting) so commands run unwrapped.
+>
+> This affects the **host** session only. A Claude Code running *inside* a sandbox is
+> on the workload image, not NixOS, so it is unaffected.
 
 ---
 
