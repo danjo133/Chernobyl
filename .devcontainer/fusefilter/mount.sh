@@ -1,31 +1,45 @@
 #!/usr/bin/env bash
 # Mount the gitignore-filtered view of SANDBOX_SOURCE at SANDBOX_MOUNT, idempotently,
-# and persist SANDBOX_MOUNT into .devcontainer/.env so compose picks it up.
+# and persist SANDBOX_MOUNT into the sandbox's env file so compose picks it up.
 # Invoked by devcontainer.json initializeCommand (VS Code) and by the `sandbox` CLI.
-# UNVERIFIED scaffold. See docs/SANDBOX-PLAN.md §3.3, §13.
+# See docs/SANDBOX-PLAN.md §3.3, §13.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DC_DIR="$(cd "$HERE/.." && pwd)"
 
+# Where the CLI keeps writable state. The install dir ($HERE) may be read-only and
+# shared between users, so nothing below may write into it.
+STATE="${SANDBOX_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-sandbox}"
+# The per-sandbox env file. The `sandbox` CLI passes it; the VS Code
+# initializeCommand path has no CLI, so fall back to the legacy in-repo location.
+ENV_FILE="${SANDBOX_ENV_FILE:-$DC_DIR/.env}"
+
 # Source the env file if present (the CLI writes it; VS Code path may rely on defaults).
-[ -f "$DC_DIR/.env" ] && set -a && . "$DC_DIR/.env" && set +a || true
+[ -f "$ENV_FILE" ] && set -a && . "$ENV_FILE" && set +a || true
 
 # Defaults: expose the repo that contains .devcontainer, mount under the user runtime dir.
 SANDBOX_SOURCE="${SANDBOX_SOURCE:-$(cd "$DC_DIR/.." && pwd)}"
 SANDBOX_NAME="${SANDBOX_NAME:-cc-sandbox}"
 SANDBOX_MOUNT="${SANDBOX_MOUNT:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/devfilter/$SANDBOX_NAME}"
 
-BIN="$HERE/gitignore-fuse"
-if [ ! -x "$BIN" ]; then
-  echo "mount.sh: building gitignore-fuse..."
+# Prefer a binary shipped by `make install`, then one built earlier into state, then
+# build it. Building lands in $STATE/bin when $HERE is not writable (shared install).
+BIN=""
+for cand in "$HERE/gitignore-fuse" "$STATE/bin/gitignore-fuse"; do
+  [ -x "$cand" ] && { BIN="$cand"; break; }
+done
+if [ -z "$BIN" ]; then
+  if [ -w "$HERE" ]; then BIN="$HERE/gitignore-fuse"; else BIN="$STATE/bin/gitignore-fuse"; fi
+  mkdir -p "$(dirname "$BIN")"
+  echo "mount.sh: building gitignore-fuse -> $BIN"
   # CGO_ENABLED=0: go-fuse is pure Go; keep the binary static (and buildable without gcc).
   if command -v go >/dev/null; then
     ( cd "$HERE" && CGO_ENABLED=0 go build -o "$BIN" . )
   elif command -v nix >/dev/null; then
     ( cd "$HERE" && nix shell nixpkgs#go --command env CGO_ENABLED=0 go build -o "$BIN" . )
   else
-    echo "mount.sh: need go (or nix) to build gitignore-fuse" >&2; exit 1
+    echo "mount.sh: need go (or nix) to build gitignore-fuse, or install it with 'make install'" >&2; exit 1
   fi
 fi
 
@@ -55,8 +69,9 @@ else
 fi
 
 # Persist the resolved mount path for compose.
-touch "$DC_DIR/.env"
-grep -v '^SANDBOX_MOUNT=' "$DC_DIR/.env" > "$DC_DIR/.env.tmp" || true
-echo "SANDBOX_MOUNT=$SANDBOX_MOUNT" >> "$DC_DIR/.env.tmp"
-mv "$DC_DIR/.env.tmp" "$DC_DIR/.env"
+mkdir -p "$(dirname "$ENV_FILE")"
+touch "$ENV_FILE"
+grep -v '^SANDBOX_MOUNT=' "$ENV_FILE" > "$ENV_FILE.tmp" || true
+echo "SANDBOX_MOUNT=$SANDBOX_MOUNT" >> "$ENV_FILE.tmp"
+mv "$ENV_FILE.tmp" "$ENV_FILE"
 echo "mount.sh: ready ($SANDBOX_MOUNT)"

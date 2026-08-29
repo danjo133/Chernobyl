@@ -18,7 +18,7 @@ ${BROKER_CONTROL_DIR:-./.broker-control}  (host)  ->  /run/broker-control  (gate
 
 > **Also here (different job):** `flywheel.py` reads the LLM traffic the gateway captures
 > under `sandbox up --flywheel` — `stats` / `tail` / `export` over
-> `.broker-control-<name>/flywheel/`. It touches no credentials and no redis; it is in this
+> `<state>/sandboxes/<name>/control/flywheel/`. It touches no credentials and no redis; it is in this
 > directory because it is the other host-side reader of a control dir. See plan §18 and the
 > unredacted-content warning in `SECURITY.md`.
 

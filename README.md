@@ -68,12 +68,56 @@ service:gateway` (firewall outside the workload's reach) and the gateway-as-brok
 | [`broker/`](broker/) | host-side credential broker: `webui.py` (password-gated web app) + `fill.py` (CLI filler) that run real OAuth and mint scoped handles, plus `flywheel.py` (read/export captured LLM traffic). See its [README](broker/README.md). |
 | [`tooling/`](tooling/) | standalone bug-bounty tooling (bb-hunter image, scope guard, MCP/LiteLLM helpers) — usable outside a sandbox too |
 | [`tooling/searxng/`](tooling/searxng/) | deploy-it-yourself SearXNG (compose + settings) that gives every harness web search through one allowlisted host — runs **outside** the sandbox, see its [README](tooling/searxng/README.md) |
+| [`install.sh`](install.sh) / [`Makefile`](Makefile) | installer: checks host prerequisites, builds the FUSE filter, puts `sandbox` on your `PATH` |
 | [`docs/SANDBOX-PLAN.md`](docs/SANDBOX-PLAN.md) | full design, threat model, phased plan |
+
+## Install
+
+Prerequisites (plan §9): **rootless Docker** (recommended) or Podman with
+`docker compose`, `fuse3`, `python3`, and — on rootful Docker only — `user_allow_other`.
+Building the FUSE filter needs Go (or Nix); a finished install ships the binary, so
+the target machine does not need Go unless it is building.
+
+```bash
+git clone https://github.com/danjo133/Chernobyl.git && cd Chernobyl
+
+./install.sh --check      # report on prerequisites, change nothing
+./install.sh              # install for you into ~/.local  (no root)
+./install.sh --system     # or: install into /usr/local for every user (uses sudo)
+```
+
+`install.sh` wraps the `Makefile`, which you can also drive directly —
+`make install PREFIX=/opt/agent-sandbox`, `make uninstall`, `make test`. Installing
+puts the payload in `$PREFIX/lib/agent-sandbox` and symlinks `$PREFIX/bin/sandbox` at
+it; if `$PREFIX/bin` is not on your `PATH`, the installer says so.
+
+To update, `git pull` and re-run `./install.sh`.
+
+### What lives where
+
+The install tree is **read-only at runtime** — the CLI writes nothing into it. That is
+what makes one system-wide install safe to share: users never collide, and never see
+each other's sandboxes.
+
+| Path | What | Override with |
+|---|---|---|
+| `$PREFIX/lib/agent-sandbox/` | the install itself (CLI, compose topology, gateway, broker) | `PREFIX` |
+| `~/.local/state/agent-sandbox/` | your sandboxes: env file, egress allowlist, broker control dir, ports, TTL | `SANDBOX_STATE_DIR` (or `XDG_STATE_HOME`) |
+| `~/.sandbox/homes/` | your harness logins/settings/history, bind-mounted into every sandbox | `SANDBOX_HOMES` |
+| `$XDG_RUNTIME_DIR/devfilter/<name>/` | the FUSE-filtered view of the repo, per sandbox | — |
+
+One directory per sandbox under `state/sandboxes/<name>/`, so parallel sandboxes never
+race. Only that directory's `control/` subdir is bind-mounted into the gateway, so
+host-side material (the broker UI password, pids) stays out of any container.
+
+Upgrading from a version that kept state inside the repo? The CLI moves it into the new
+layout on first run and tells you what it moved — existing sandboxes stay drivable.
+
+`make uninstall` removes the install but deliberately keeps your state and logins.
 
 ## Quickstart
 
-Prerequisites (plan §9): **rootless Docker** (recommended) or Podman with
-`docker compose`, `fuse3`, and — on rootful Docker only — `user_allow_other`.
+Installed, the CLI is just `sandbox`; from a checkout it is `./sandbox`.
 
 ```bash
 # Bring a sandbox up against a repo (builds images, mounts the FUSE view,

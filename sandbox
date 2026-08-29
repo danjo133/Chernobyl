@@ -45,11 +45,30 @@
 # Every harness gets its own shared host-side home (SANDBOX_HOMES), so you log in once
 # per harness and every sandbox inherits it. Defaults can also come from the environment:
 # SANDBOX_HARNESS, SANDBOX_LLM_BACKEND, SANDBOX_LLM_URL, SANDBOX_MODEL, SANDBOX_CPUS, SANDBOX_MEMORY.
+#
+# Install layout: this script may be run from a checkout or through a symlink created by
+# `make install` (e.g. ~/.local/bin/sandbox -> ~/.local/lib/agent-sandbox/sandbox). It
+# writes NOTHING into its own directory, so a system-wide install can be read-only and
+# shared: per-sandbox state goes to SANDBOX_STATE_DIR (default
+# $XDG_STATE_HOME/agent-sandbox), harness logins to SANDBOX_HOMES ($HOME/.sandbox/homes).
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SELF="$HERE/$(basename "${BASH_SOURCE[0]}")"   # re-entry point: `spawn` and `reap` drive the other verbs
+# Resolve through symlinks: an install puts a symlink at $PREFIX/bin/sandbox pointing
+# into $PREFIX/lib/agent-sandbox, and everything below is found relative to the real file.
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  _link_dir="$(cd -P "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$_link_dir/$SELF" ;; esac
+done
+HERE="$(cd -P "$(dirname "$SELF")" && pwd)"
+SELF="$HERE/$(basename "$SELF")"   # re-entry point: `spawn` and `reap` drive the other verbs
 DC="$HERE/.devcontainer"
+
+# Everything the CLI writes lives here, NOT in the install dir — so $HERE can be a
+# read-only, shared/system-wide install and each user gets their own sandboxes.
+# One directory per sandbox; see state_dir() below for the layout.
+STATE="${SANDBOX_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-sandbox}"
 COMPOSE=(docker compose -f "$DC/compose.yaml")
 WEBUI_PY="$HERE/broker/webui.py"
 WEB_PORT_DEFAULT=9999
@@ -81,12 +100,86 @@ HARNESS_LIB_DIR="$DC/harness"
 . "$HARNESS_LIB_DIR/lib.sh"
 
 # --- per-sandbox state (harness selection etc.) ------------------------------
-# Kept in the sandbox's own control dir rather than .devcontainer/.env, which is
-# last-writer-wins across parallel sandboxes.
-state_dir() { echo "$DC/.broker-control-$1"; }
+# Each sandbox owns one directory under $STATE/sandboxes, so parallel sandboxes never
+# race (the old single .devcontainer/.env was last-writer-wins) and nothing is written
+# into the install dir:
+#
+#   $STATE/sandboxes/<name>/env             compose --env-file for this sandbox
+#                          /allowlist.txt   per-sandbox egress allowlist
+#                          /control/        BROKER_CONTROL_DIR, bind-mounted into the gateway
+#                          /tools-ssh/      tools-sidecar SSH key (private; not the gateway's)
+#                          /<key>           scratch scalars: harness, model, *-port, ...
+#   $STATE/current                          name used when a verb is given no --name
+#
+# Only control/ crosses into a container, so scratch keys stay one level above it.
+state_dir()      { echo "$STATE/sandboxes/$1"; }
+control_dir()    { echo "$STATE/sandboxes/$1/control"; }
+tools_ssh_dir()  { echo "$STATE/sandboxes/$1/tools-ssh"; }
+env_file()       { echo "$STATE/sandboxes/$1/env"; }
+allowlist_file() { echo "$STATE/sandboxes/$1/allowlist.txt"; }
 state_set() { mkdir -p "$(state_dir "$1")"; printf '%s\n' "$3" > "$(state_dir "$1")/$2"; }
 state_get() { local f; f="$(state_dir "$1")/$2"; [ -f "$f" ] && cat "$f" || true; }
 state_clear() { rm -f "$(state_dir "$1")/$2"; }
+
+# Point every later compose invocation at this sandbox's env file. Compose used to pick
+# up .devcontainer/.env implicitly (it sits beside compose.yaml); now that per-sandbox
+# state lives outside the install tree, the file has to be named explicitly — otherwise
+# `exec`-based verbs fail on compose.yaml's required ${SANDBOX_MOUNT:?...}.
+compose_bind() {  # NAME
+  local ef; ef="$(env_file "$1")"
+  COMPOSE=(docker compose -f "$DC/compose.yaml")
+  # `docker compose` fails outright on a missing --env-file, which would block `down`
+  # on a half-migrated sandbox. Omit the flag and let compose report the real problem.
+  [ -f "$ef" ] && COMPOSE+=(--env-file "$ef")
+  return 0
+}
+
+# The sandbox a verb acts on when --name is omitted: the last one `up` brought up.
+current_set() { mkdir -p "$STATE"; printf '%s\n' "$1" > "$STATE/current"; }
+current_get() { [ -f "$STATE/current" ] && cat "$STATE/current" || true; }
+# Resolve NAME for verbs that accept an optional --name. Dies with a useful message
+# rather than letting `set -u` or an empty compose project name fail obscurely.
+need_name() {
+  if [ -z "$NAME" ]; then
+    NAME="$(current_get)"
+    [ -n "$NAME" ] || die "no sandbox specified and none recorded — pass --name (see: sandbox ls)"
+  fi
+  # Validate and bind on BOTH paths: an explicit --name still needs the env file
+  # wired into COMPOSE, and a typo should fail here rather than half-drive compose.
+  [ -d "$(state_dir "$NAME")" ] || die "no such sandbox: '$NAME' (see: sandbox ls)"
+  compose_bind "$NAME"
+}
+
+# One-time move of state written by pre-install versions, which kept it inside the
+# repo. Keeps existing sandboxes drivable across the upgrade; no-op once done.
+migrate_legacy_state() {
+  local old new n
+  compgen -G "$DC/.broker-control-*" >/dev/null 2>&1 || return 0
+  [ -w "$DC" ] || return 0
+  for old in "$DC"/.broker-control-*/; do
+    [ -d "$old" ] || continue
+    n="$(basename "$old")"; n="${n#.broker-control-}"
+    new="$(control_dir "$n")"
+    [ -e "$new" ] && continue
+    mkdir -p "$(state_dir "$n")"
+    mv "$old" "$new" 2>/dev/null || continue
+    [ -f "$DC/.allowlist-$n.txt" ] && mv "$DC/.allowlist-$n.txt" "$(allowlist_file "$n")"
+    [ -d "$DC/.tools-$n" ] && mv "$DC/.tools-$n" "$(tools_ssh_dir "$n")"
+    # Scratch scalars lived in the control dir; lift them out of the container mount.
+    for k in harness llm-backend llm-url model small-model model-context \
+             webui-port app-port caido-port webui-password webui.pid webui.log \
+             lane started-at ttl-minutes run-id; do
+      [ -f "$new/$k" ] && mv "$new/$k" "$(state_dir "$n")/$k"
+    done
+    echo "sandbox: migrated state for '$n' -> $(state_dir "$n")" >&2
+  done
+  if [ -f "$DC/.env" ]; then
+    n="$(grep -m1 '^SANDBOX_NAME=' "$DC/.env" | cut -d= -f2- || true)"
+    [ -n "$n" ] && [ -d "$(state_dir "$n")" ] && [ ! -f "$(env_file "$n")" ] \
+      && mv "$DC/.env" "$(env_file "$n")" && current_set "$n"
+  fi
+}
+migrate_legacy_state
 
 # Compose project names must be [a-z0-9][a-z0-9_-]*: lowercase, strip trailing '-'
 # (tr -c also mangles the trailing newline into one). `up` and `spawn` must derive
@@ -217,18 +310,23 @@ unset _h _p
 # Runs on the host (127.0.0.1 only), gated by a per-sandbox password, talking to
 # the gateway over the control socket. NEVER published into the gateway netns —
 # that's reachable from the workload. See docs/SANDBOX-PLAN.md §15.
-webui_start() {  # NAME  CTRL_DIR  PORT
-  local name="$1" ctrl="$2" port="$3"
-  local pwf="$ctrl/webui-password" pidf="$ctrl/webui.pid"
+webui_start() {  # NAME  PORT
+  # Host-side bookkeeping (password, pid, port, log) stays in the sandbox's state dir;
+  # only the socket and request log it reads live in control/, which the gateway sees.
+  # Keeping the UI password out of that bind mount is deliberate.
+  local name="$1" port="$2" sd ctrl
+  sd="$(state_dir "$name")"; ctrl="$(control_dir "$name")"; mkdir -p "$sd" "$ctrl"
+  local pwf="$sd/webui-password" pidf="$sd/webui.pid"
   [ -f "$pwf" ] || { umask 077; python3 -c 'import secrets;print(secrets.token_urlsafe(18))' > "$pwf"; }
-  echo "$port" > "$ctrl/webui-port"
+  echo "$port" > "$sd/webui-port"
   if [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then return 0; fi  # already running
   nohup python3 "$WEBUI_PY" --socket "$ctrl/broker.sock" --log "$ctrl/requests.log" \
-    --password-file "$pwf" --port "$port" >> "$ctrl/webui.log" 2>&1 &
+    --password-file "$pwf" --port "$port" >> "$sd/webui.log" 2>&1 &
   echo $! > "$pidf"
 }
-webui_stop() {  # CTRL_DIR
-  local pidf="$1/webui.pid" pid
+webui_stop() {  # NAME
+  local pidf; pidf="$(state_dir "$1")/webui.pid"
+  local pid
   if [ -f "$pidf" ]; then
     pid="$(cat "$pidf")"
     kill "$pid" 2>/dev/null || true
@@ -240,9 +338,9 @@ webui_stop() {  # CTRL_DIR
 # across restarts), else the first free port from 9999 up that no OTHER sandbox claims.
 assign_web_port() {  # NAME -> echoes port
   local name="$1" used="" f
-  local ownfile="$DC/.broker-control-$name/webui-port"   # separate line: $name must be set first (set -u)
+  local ownfile="$(state_dir "$name")/webui-port"   # separate line: $name must be set first (set -u)
   [ -f "$ownfile" ] && { cat "$ownfile"; return; }
-  for f in "$DC"/.broker-control-*/webui-port; do [ -f "$f" ] && used="$used $(cat "$f")"; done
+  for f in "$STATE"/sandboxes/*/webui-port; do [ -f "$f" ] && used="$used $(cat "$f")"; done
   python3 -c '
 import socket, sys
 used = set(sys.argv[1].split())
@@ -262,9 +360,9 @@ else:
 # the broker web UI's 9999+), reusing its own if already assigned. Mirrors assign_web_port.
 assign_caido_port() {  # NAME -> echoes port
   local name="$1" used="" f
-  local ownfile="$DC/.broker-control-$name/caido-port"
+  local ownfile="$(state_dir "$name")/caido-port"
   [ -f "$ownfile" ] && { cat "$ownfile"; return; }
-  for f in "$DC"/.broker-control-*/caido-port; do [ -f "$f" ] && used="$used $(cat "$f")"; done
+  for f in "$STATE"/sandboxes/*/caido-port; do [ -f "$f" ] && used="$used $(cat "$f")"; done
   python3 -c '
 import socket, sys
 used = set(sys.argv[1].split())
@@ -285,9 +383,9 @@ else:
 # sandboxes never collide on host :3000 (the compose default). Maps host->container:3000.
 assign_app_port() {  # NAME -> echoes host port
   local name="$1" used="" f
-  local ownfile="$DC/.broker-control-$name/app-port"
+  local ownfile="$(state_dir "$name")/app-port"
   [ -f "$ownfile" ] && { cat "$ownfile"; return; }
-  for f in "$DC"/.broker-control-*/app-port; do [ -f "$f" ] && used="$used $(cat "$f")"; done
+  for f in "$STATE"/sandboxes/*/app-port; do [ -f "$f" ] && used="$used $(cat "$f")"; done
   python3 -c '
 import socket, sys
 used = set(sys.argv[1].split())
@@ -476,7 +574,8 @@ case "$cmd" in
     # appends new --allow-url/--allow-ip entries (deduped) without clobbering live edits
     # made via `sandbox allow`. broker_addon.py hot-reloads it on change — no restart.
     # (Ignored when --allow-internet, which bypasses the proxy entirely.)
-    ALLOWLIST_FILE="$DC/.allowlist-$NAME.txt"
+    ALLOWLIST_FILE="$(allowlist_file "$NAME")"
+    mkdir -p "$(state_dir "$NAME")"
     if [ ! -f "$ALLOWLIST_FILE" ]; then
       cp "$DC/gateway/allowed-domains.txt" "$ALLOWLIST_FILE"
       printf '\n# --- per-sandbox additions (%s) ---\n' "$NAME" >> "$ALLOWLIST_FILE"
@@ -490,12 +589,12 @@ case "$cmd" in
     # Write the env compose + mount.sh consume. The TTL clock starts here: a re-`up`
     # of the same sandbox is a fresh run and gets its full lifetime again.
     STARTED_AT="$(date +%s)"
-    cat > "$DC/.env" <<EOF
+    cat > "$(env_file "$NAME")" <<EOF
 SANDBOX_NAME=$NAME
 SANDBOX_SOURCE=$SOURCE
 SANDBOX_MOUNT=$MOUNT
 CLAUDE_CODE_VERSION=${CLAUDE_CODE_VERSION:-latest}
-BROKER_CONTROL_DIR=$DC/.broker-control-$NAME
+BROKER_CONTROL_DIR=$(control_dir "$NAME")
 MINIONS_DIR=$MINIONS_DIR
 ALLOW_INTERNET=$ALLOW_INTERNET
 ALLOWLIST_FILE=$ALLOWLIST_FILE
@@ -508,8 +607,11 @@ SANDBOX_STARTED_AT=$STARTED_AT
 SANDBOX_TTL_MINUTES=$TTL
 SANDBOX_RUN_ID=$RUN_ID
 EOF
-    harness_home_env_lines >> "$DC/.env"   # SANDBOX_CLAUDE_HOME / _PI_ / _OMP_ / _PRIME_HOME
-    mkdir -p "$DC/.broker-control-$NAME"
+    harness_home_env_lines >> "$(env_file "$NAME")"   # SANDBOX_CLAUDE_HOME / _PI_ / _OMP_ / _PRIME_HOME
+    mkdir -p "$(control_dir "$NAME")"
+    current_set "$NAME"
+    # Before any COMPOSE+=(-f ...) below — compose_bind reassigns the array.
+    compose_bind "$NAME"
 
     # Remember the selection for this sandbox: `open` reuses it, `ls` displays it.
     state_set "$NAME" harness "$HARNESS"
@@ -537,12 +639,12 @@ EOF
     # mirroring the broker UI (9999+) and Caido (8090+) ranges so parallel sandboxes
     # never collide on host :3000 (the compose default).
     if [ -n "$PORT" ]; then
-      echo "FORWARD_SPEC=127.0.0.1:$PORT" >> "$DC/.env"
+      echo "FORWARD_SPEC=127.0.0.1:$PORT" >> "$(env_file "$NAME")"
       APP_PORT="${PORT%%:*}"; CTR_PORT="${PORT#*:}"
     else
       APP_PORT="$(assign_app_port "$NAME")"; CTR_PORT=3000
-      echo "$APP_PORT" > "$DC/.broker-control-$NAME/app-port"
-      echo "FORWARD_SPEC=127.0.0.1:$APP_PORT:3000" >> "$DC/.env"
+      echo "$APP_PORT" > "$(state_dir "$NAME")/app-port"
+      echo "FORWARD_SPEC=127.0.0.1:$APP_PORT:3000" >> "$(env_file "$NAME")"
     fi
     [ "$ALLOW_INTERNET" = "1" ] && echo "sandbox: WARNING — --allow-internet: egress is UNRESTRICTED (no allowlist, no MITM)." >&2
 
@@ -561,7 +663,7 @@ EOF
       HUNTER_IMAGE="${HUNTER_IMAGE:-bb-hunter:latest}"
       docker image inspect "$HUNTER_IMAGE" >/dev/null 2>&1 \
         || die "tools: image '$HUNTER_IMAGE' not found — build it first: (cd tooling/docker && docker compose build)"
-      TOOLS_SSH_DIR="$DC/.tools-$NAME"; mkdir -p "$TOOLS_SSH_DIR"; chmod 700 "$TOOLS_SSH_DIR"
+      TOOLS_SSH_DIR="$(tools_ssh_dir "$NAME")"; mkdir -p "$TOOLS_SSH_DIR"; chmod 700 "$TOOLS_SSH_DIR"
       if [ ! -f "$TOOLS_SSH_DIR/id_hunter" ]; then
         ssh-keygen -t ed25519 -N '' -q -f "$TOOLS_SSH_DIR/id_hunter" -C "claude@sandbox-$NAME"
         cp "$TOOLS_SSH_DIR/id_hunter.pub" "$TOOLS_SSH_DIR/authorized_keys"
@@ -570,24 +672,24 @@ EOF
       COMPOSE+=(-f "$DC/compose.tools.yaml")
       # Caido (operator's proxy) UI port — stable per sandbox, host-local only.
       CAIDO_UI_PORT="$(assign_caido_port "$NAME")"
-      echo "$CAIDO_UI_PORT" > "$DC/.broker-control-$NAME/caido-port"
-      { echo "TOOLS_SSH_DIR=$TOOLS_SSH_DIR"; echo "TOOLS_SSH_PORT=2222"; echo "HUNTER_IMAGE=$HUNTER_IMAGE"; echo "CAIDO_UI_PORT=$CAIDO_UI_PORT"; } >> "$DC/.env"
+      echo "$CAIDO_UI_PORT" > "$(state_dir "$NAME")/caido-port"
+      { echo "TOOLS_SSH_DIR=$TOOLS_SSH_DIR"; echo "TOOLS_SSH_PORT=2222"; echo "HUNTER_IMAGE=$HUNTER_IMAGE"; echo "CAIDO_UI_PORT=$CAIDO_UI_PORT"; } >> "$(env_file "$NAME")"
     fi
 
-    "$DC/fusefilter/mount.sh"
-    COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" --env-file "$DC/.env" up -d --build
+    SANDBOX_ENV_FILE="$(env_file "$NAME")" SANDBOX_STATE_DIR="$STATE" "$DC/fusefilter/mount.sh"
+    COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" up -d --build
     # postCreateCommand only runs under VS Code — on this headless path the CA
     # trust must be installed explicitly or all TLS in the workload fails.
-    COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" --env-file "$DC/.env" \
+    COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" \
       exec -u root devcontainer /usr/local/bin/trust-ca.sh   # system store
-    COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" --env-file "$DC/.env" \
+    COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" \
       exec devcontainer /usr/local/bin/trust-ca.sh           # node home (NODE_EXTRA_CA_CERTS)
 
     # Tools sidecar: wire the devcontainer's SSH client to the hunter box (2 passes).
     if [ "$TOOLS" = "1" ]; then
-      COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" --env-file "$DC/.env" \
+      COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" \
         exec -u root devcontainer /usr/local/bin/tools-client-setup.sh   # 'hunter' wrapper
-      COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" --env-file "$DC/.env" \
+      COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" \
         exec devcontainer /usr/local/bin/tools-client-setup.sh           # ssh alias 'hunter'
       echo "sandbox: tools sidecar up. Claude runs:  hunter <cmd>   (e.g. hunter nuclei -u https://...)"
       echo "sandbox: manual shell:  ./sandbox tools --name $NAME   |   unrestricted box:  ./sandbox tools --name $NAME --unrestricted"
@@ -596,7 +698,7 @@ EOF
 
     # Host-side credential/log web UI for this sandbox (auto-assigned free port).
     [ -n "$WEB_PORT" ] || WEB_PORT="$(assign_web_port "$NAME")"
-    webui_start "$NAME" "$DC/.broker-control-$NAME" "$WEB_PORT"
+    webui_start "$NAME" "$WEB_PORT"
     echo "sandbox: '$NAME' up. Open with:  ./sandbox open --name $NAME"
     echo "sandbox: harness   $HARNESS -> $BACKEND${MODEL:+ ($MODEL)}  [$B_URL]"
     [ -z "$POLICY" ] || echo "sandbox: policy   $POLICY -> lane $LANE, egress +${POLICY_EGRESS}"
@@ -608,7 +710,7 @@ EOF
     echo "sandbox: app port  http://127.0.0.1:$APP_PORT -> container :$CTR_PORT"
     if [ "$FLYWHEEL" = 1 ]; then
       echo "sandbox: flywheel ON — every LLM call is recorded UNREDACTED (prompts, code, tool output)"
-      echo "sandbox:            to $DC/.broker-control-$NAME/flywheel/ ; read it with ./sandbox flywheel --name $NAME stats"
+      echo "sandbox:            to $(control_dir "$NAME")/flywheel/ ; read it with ./sandbox flywheel --name $NAME stats"
     fi
     if [ "$HARNESS" != claudecode ] && [ "$BACKEND" = anthropic ]; then
       echo "sandbox: NOTE — $HARNESS + anthropic expects the real key to come from the broker" >&2
@@ -661,8 +763,8 @@ EOF
     esac; done
     NOW="$(date +%s)"
     shopt -s nullglob
-    for ctrl in "$DC"/.broker-control-*/; do
-      name="$(basename "$ctrl")"; name="${name#.broker-control-}"
+    for ctrl in "$STATE"/sandboxes/*/; do
+      name="$(basename "$ctrl")"
       started="$(cat "$ctrl/started-at" 2>/dev/null || true)"
       [ -n "$started" ] || continue                 # never brought up by a version that records it
       ttl="$(cat "$ctrl/ttl-minutes" 2>/dev/null || true)"
@@ -695,10 +797,10 @@ EOF
     echo "Broker UIs (host-only; password unlocks credential + log management):"
     shopt -s nullglob
     found=0
-    for ctrl in "$DC"/.broker-control-*/; do
+    for ctrl in "$STATE"/sandboxes/*/; do
       [ -f "$ctrl/webui-password" ] || continue
       found=1
-      name="$(basename "$ctrl")"; name="${name#.broker-control-}"
+      name="$(basename "$ctrl")"
       port="$(cat "$ctrl/webui-port" 2>/dev/null || echo "$WEB_PORT_DEFAULT")"
       status="stopped"
       if [ -f "$ctrl/webui.pid" ] && kill -0 "$(cat "$ctrl/webui.pid")" 2>/dev/null; then status="running"; fi
@@ -742,10 +844,9 @@ EOF
       --url|--ip) EXTRA="$EXTRA $2"; shift 2;;
       *) die "unknown arg $1";;
     esac; done
-    [ -n "$NAME" ] || { [ -f "$DC/.env" ] && . "$DC/.env" && NAME="$SANDBOX_NAME"; }
-    [ -n "$NAME" ] || die "--name required"
+    need_name
     [ -n "$EXTRA" ] || die "give at least one --url DOMAIN or --ip ADDR"
-    AF="$DC/.allowlist-$NAME.txt"
+    AF="$(allowlist_file "$NAME")"
     [ -f "$AF" ] || die "no allowlist for '$NAME' (is it up? run: ./sandbox up ...)"
     set -f      # `*.foo.com` is a valid entry — do not let the shell expand it
     for h in $EXTRA; do
@@ -764,14 +865,13 @@ EOF
       --stop) STOP=1; shift;;
       *) die "unknown arg $1";;
     esac; done
-    [ -n "$NAME" ] || { [ -f "$DC/.env" ] && . "$DC/.env" && NAME="$SANDBOX_NAME"; }
-    [ -n "$NAME" ] || die "--name required"
-    CTRL="$DC/.broker-control-$NAME"
+    need_name
+    CTRL="$(control_dir "$NAME")"
     [ -d "$CTRL" ] || die "no such sandbox control dir: $CTRL"
     [ -n "$WEB_PORT" ] || WEB_PORT="$(assign_web_port "$NAME")"   # reuse this sandbox's port
-    if [ "$STOP" = 1 ]; then webui_stop "$CTRL"; echo "sandbox: broker UI for '$NAME' stopped."; else
+    if [ "$STOP" = 1 ]; then webui_stop "$NAME"; echo "sandbox: broker UI for '$NAME' stopped."; else
       # Restart-by-default: stop any running instance first so this picks up UI changes.
-      webui_stop "$CTRL"; webui_start "$NAME" "$CTRL" "$WEB_PORT"
+      webui_stop "$NAME"; webui_start "$NAME" "$WEB_PORT"
       echo "sandbox: broker UI for '$NAME' (re)started at http://127.0.0.1:$WEB_PORT (password via ./sandbox ls)"
     fi
     ;;
@@ -779,12 +879,12 @@ EOF
   down)
     NAME=""
     while [ $# -gt 0 ]; do case "$1" in --name) NAME="$2"; shift 2;; *) die "unknown arg $1";; esac; done
-    [ -n "$NAME" ] || { [ -f "$DC/.env" ] && . "$DC/.env" && NAME="$SANDBOX_NAME"; }
+    need_name
     [ -n "$NAME" ] || die "--name required (or run from a configured sandbox)"
-    webui_stop "$DC/.broker-control-$NAME"
+    webui_stop "$NAME"
     # Include the tools overlay if this sandbox used it, so the sidecar is torn down too.
-    [ -d "$DC/.tools-$NAME" ] && COMPOSE+=(-f "$DC/compose.tools.yaml")
-    COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" --env-file "$DC/.env" down
+    [ -d "$(tools_ssh_dir "$NAME")" ] && COMPOSE+=(-f "$DC/compose.tools.yaml")
+    COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" down
     "$DC/fusefilter/unmount.sh" "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/devfilter/$NAME" || true
     ;;
 
@@ -800,9 +900,8 @@ EOF
       -*) die "unknown arg $1";;
       *) break;;
     esac; done
-    [ -n "$NAME" ] || { [ -f "$DC/.env" ] && . "$DC/.env" && NAME="$SANDBOX_NAME"; }
-    [ -n "$NAME" ] || die "--name required"
-    [ -f "$DC/.env" ] && . "$DC/.env"
+    need_name
+    set -a; . "$(env_file "$NAME")"; set +a
     if [ "$UNRESTRICTED" = "1" ]; then
       echo "sandbox: WARNING — unrestricted tools box: FULL internet (NOT through the gateway), NET_RAW+NET_ADMIN, your repo mounted. Manual use only; not the contained agent path." >&2
       exec docker run --rm -it \
@@ -810,8 +909,8 @@ EOF
         -v "${SANDBOX_SOURCE:-$PWD}:/workspace" -v bb-hunter-wordlists:/opt/wordlists -w /workspace \
         "${HUNTER_IMAGE:-bb-hunter:latest}" bash
     fi
-    [ -d "$DC/.tools-$NAME" ] || die "tools sidecar not enabled for '$NAME' — bring it up with: ./sandbox up --tools ..."
-    COMPOSE_T=(docker compose -f "$DC/compose.yaml" -f "$DC/compose.tools.yaml" --env-file "$DC/.env")
+    [ -d "$(tools_ssh_dir "$NAME")" ] || die "tools sidecar not enabled for '$NAME' — bring it up with: ./sandbox up --tools ..."
+    COMPOSE_T=(docker compose -f "$DC/compose.yaml" -f "$DC/compose.tools.yaml" --env-file "$(env_file "$NAME")")
     if [ "$#" -gt 0 ]; then
       COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE_T[@]}" exec tools "$@"        # one-off command
     else
@@ -842,8 +941,7 @@ EOF
       -*) die "unknown arg $1";;
       *) break;;
     esac; done
-    [ -n "$NAME" ] || { [ -f "$DC/.env" ] && . "$DC/.env" && NAME="$SANDBOX_NAME"; }
-    [ -n "$NAME" ] || die "--name required"
+    need_name
 
     # Precedence: flag > what this sandbox last used > environment default > ask.
     [ -n "$HARNESS" ] || HARNESS="$(state_get "$NAME" harness)"
@@ -869,7 +967,7 @@ EOF
     # Switching harness or backend usually needs egress this sandbox was not brought up
     # with. The allowlist is hot-reloaded, so adding to it here is enough — no restart,
     # and the broker keeps whatever credentials you set.
-    AF="$DC/.allowlist-$NAME.txt"
+    AF="$(allowlist_file "$NAME")"
     SEARCH_DOMAIN=""
     [ -z "$SEARCH_URL" ] || SEARCH_DOMAIN="$(url_host "$SEARCH_URL")"
     if [ -f "$AF" ]; then
@@ -957,9 +1055,8 @@ EOF
       --) shift; break;;
       *) break;;
     esac; done
-    [ -n "$NAME" ] || { [ -f "$DC/.env" ] && . "$DC/.env" && NAME="$SANDBOX_NAME"; }
-    [ -n "$NAME" ] || die "--name required"
-    CAP="$DC/.broker-control-$NAME/flywheel"
+    need_name
+    CAP="$(control_dir "$NAME")/flywheel"
     [ -d "$CAP" ] || die "no captures for '$NAME' — bring it up with:  ./sandbox up --flywheel ..."
     [ $# -gt 0 ] || set -- stats
     exec python3 "$HERE/broker/flywheel.py" --dir "$CAP" "$@"
@@ -983,7 +1080,7 @@ EOF
       -*) die "unknown arg $1";;
       *) die "unexpected arg '$1' (pass a command after '--', e.g.  run --name NAME -- $*)";;
     esac; done
-    [ -n "$NAME" ] || { [ -f "$DC/.env" ] && . "$DC/.env" && NAME="$SANDBOX_NAME"; }
+    need_name
     [ -n "$NAME" ] || die "--name required (or run from a configured sandbox)"
 
     # --stop / --logs act on a previously detached run; its pid/log live in the container.
@@ -1033,6 +1130,8 @@ EOF
     ;;
 
   *)
-    sed -n '2,47p' "$0"
+    # Print the usage block: every comment line after the shebang, up to the first
+    # line that is not a comment. Read $SELF, not $0 — $0 is the symlink when installed.
+    awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$SELF"
     ;;
 esac

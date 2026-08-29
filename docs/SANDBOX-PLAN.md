@@ -250,8 +250,8 @@ namespace-scoped) and prefer short-lived tokens — see §7.
 the kube apiserver host, plus per-toolchain (`pypi.org`, `files.pythonhosted.org`, …).
 Telemetry domains intentionally **omitted** (disabled instead).
 
-The live file is **per-sandbox** (`.allowlist-<name>.txt`, seeded from this base on first
-`up`) and **hot-reloaded** by `broker_addon.py` on change. Add entries to a *running*
+The live file is **per-sandbox** (`sandboxes/<name>/allowlist.txt` in the state dir,
+§10.1, seeded from this base on first `up`) and **hot-reloaded** by `broker_addon.py` on change. Add entries to a *running*
 sandbox with `sandbox allow --name <n> --url DOMAIN | --ip ADDR` — no teardown, so broker
 credentials (which are memory-only; see §8) are not lost. `sandbox up --allow-url …` seeds
 and appends (deduped); it does not clobber entries added live.
@@ -323,6 +323,13 @@ designed in from the start:**
   Without it, Podman/Buildah inside the workload can't create the namespace a rootless
   build needs.
 - VS Code + Dev Containers extension (for the editor path).
+- Go (or Nix) **to build** the FUSE filter. A finished install ships the binary, so a
+  machine that only *runs* sandboxes does not need Go.
+
+`./install.sh --check` reports on all of the above without changing anything, and
+splits them by consequence: a missing *required* tool means no sandbox can come up, a
+missing optional one only disables a feature (`--worktree` needs git, `--policy` needs
+yq or PyYAML). See §10.1 for what installing puts where.
 
 > **Current blocker — Bash is non-functional in this Claude Code session.** Every
 > command returns `bwrap: Can't create file at /run/wrappers/bin: No such file or
@@ -354,13 +361,51 @@ designed in from the start:**
     mount.sh / unmount.sh    # helpers called by initializeCommand
   managed-settings.json      # → /etc/claude-code/managed-settings.json
   build-dirs.txt             # per-project list of build/dep dirs to back with volumes
-  .env.example
 broker/                       # host-side credential tooling (runs real OAuth, fills redis, mints handles)
   fill.py                     # CLI filler (prints redis commands / future control-socket client)
   webui.py                    # host-only web UI (127.0.0.1, password-gated): manage creds + watch egress log
 sandbox                       # CLI: up | ls | down | open — worktree, project naming, ports, resource limits
+Makefile / install.sh         # installer: prerequisite checks, builds the FUSE filter, puts `sandbox` on PATH
 docs/SANDBOX-PLAN.md          # this document
 ```
+
+### 10.1 Installed layout — the tree is read-only at runtime
+
+The repo above is the *source*. `make install` copies it to
+`$PREFIX/lib/agent-sandbox` and symlinks `$PREFIX/bin/sandbox` at it (`PREFIX`
+defaults to `~/.local`; `--system` uses `/usr/local`). `sandbox` resolves symlinks
+before locating `.devcontainer/`, so the symlink is the supported entry point.
+
+**The CLI writes nothing into its own directory.** That is the property that makes a
+single system-wide install shareable: users never write to it, never collide, and
+never see each other's sandboxes. Everything mutable is keyed per user, then per
+sandbox:
+
+```
+$PREFIX/lib/agent-sandbox/            the install (read-only at runtime)
+$SANDBOX_STATE_DIR/                   default $XDG_STATE_HOME/agent-sandbox
+  current                             name used by verbs given no --name
+  bin/gitignore-fuse                  built here only if the install shipped no binary
+  sandboxes/<name>/
+    env                               compose --env-file for THIS sandbox
+    allowlist.txt                     per-sandbox egress allowlist (hot-reloaded)
+    harness, model, *-port, ttl-...   scratch scalars: selection, ports, TTL clock
+    webui-password, webui.pid         host-side broker-UI bookkeeping
+    control/                          BROKER_CONTROL_DIR — the ONLY dir bind-mounted
+                                      into the gateway (socket, request log, flywheel)
+    tools-ssh/                        tools-sidecar SSH key (private; §16)
+$SANDBOX_HOMES/                       default ~/.sandbox/homes — per-harness logins,
+                                      bind-mounted into every sandbox (§17)
+$XDG_RUNTIME_DIR/devfilter/<name>/    the FUSE-filtered view (§3.3)
+```
+
+Only `control/` crosses into a container, so host-side material — the broker UI
+password, pids, the sidecar's private key — stays outside every bind mount by
+construction rather than by convention.
+
+The FUSE binary is built at install time and shipped in the tree, so target machines
+need Go only if they build. If the install carries no binary and its directory is not
+writable, `mount.sh` falls back to building into `$SANDBOX_STATE_DIR/bin`.
 
 ---
 
@@ -387,8 +432,16 @@ Working on several things at once = several independent sandboxes running in par
   but the filler mints **per-sandbox scoped handles** — sandbox A's handle resolves
   only to repo-A's creds. Each gateway authenticates as its sandbox and resolves only
   its own partition.
+- **State: one directory per sandbox, outside the install.** Each sandbox owns
+  `$SANDBOX_STATE_DIR/sandboxes/<name>/` (§10.1) holding its compose env file,
+  allowlist, broker control dir and port/TTL bookkeeping. This replaced a single
+  shared `.devcontainer/.env` rewritten by every `up`, which was last-writer-wins:
+  bringing up a second sandbox rewrote the first one's compose environment, and the
+  "current sandbox" that `down`/`open` acted on with no `--name`. Parallel sandboxes
+  now share no mutable file.
 - **Ports & resources:** dynamic host-port assignment per sandbox (no collisions; see
-  §12), per-sandbox CPU/mem limits.
+  §12), per-sandbox CPU/mem limits. Port claims live in each sandbox's own state dir
+  and are scanned across all of them, so assignment stays collision-free per user.
 - **CA:** one shared trusted CA (simpler images) or per-sandbox ephemeral (tighter);
   default shared.
 - **Management:** `sandbox up | ls | down | open` handles project naming, worktrees,
@@ -451,7 +504,11 @@ so shared-netns is transparent), and port forwarding (tunneled over `docker exec
 auto free host port per container) are all fully supported. The Claude Code extension
 runs inside the container. Caveats: `initializeCommand` fires every reopen → make the
 FUSE mount idempotent; there is **no host-side teardown hook** → the `sandbox` CLI
-cleans up stale mounts.
+cleans up stale mounts. A third: `initializeCommand` runs `mount.sh` *without* the
+CLI, so nothing tells it which sandbox's env file to use — on that path it falls back
+to the legacy in-repo `.devcontainer/.env` (§10.1). The VS Code flow therefore assumes
+a writable checkout, not a shared read-only install; drive a shared install from the
+CLI and let the IDE attach to the running container (see below).
 
 **JetBrains — works, with caveats.** Dev container support is a spec *subset*; the two
 risky pieces are ours:
@@ -533,8 +590,8 @@ bind-mounted control dir. Both channels exploit that the workload shares the gat
  BROWSER ──► 127.0.0.1:9999 (HOST loopback — invisible to the workload)
                 │  served by broker/webui.py, launched by the `sandbox` CLI
                 ▼
-   .broker-control-<name>/broker.sock        (host ⇄ gateway, NOT in the workload's mount ns)
-   .broker-control-<name>/requests.log        (gateway appends redacted JSONL; host tails)
+   sandboxes/<name>/control/broker.sock   (host ⇄ gateway, NOT in the workload's mount ns)
+   sandboxes/<name>/control/requests.log  (gateway appends redacted JSONL; host tails)
                 │
    GATEWAY: control_server.py ──► redis (real creds)   broker_addon.py ──► request log
                 ▲
@@ -556,7 +613,7 @@ bind-mounted control dir. Both channels exploit that the workload shares the gat
 > and are intended for **non-secret markers** (e.g. a bug-bounty `X-Tag`), since they
 > broadcast the header to every subdomain reached. On a request both tiers are merged, the
 > exact record winning on conflict — so a scope-wide marker and a host-specific token coexist.
-| host | `sandbox` CLI | `up` mints the password (`.broker-control-<name>/webui-password`, mode 600) and launches the UI on an **auto-assigned free port** (first free from 9999, skipping ports other sandboxes claim; stable across restarts via `webui-port`); `ls` prints each sandbox's URL + password + status; `down` stops it; `web [--stop]` (re)starts after a host reboot. `--web-port N` overrides. |
+| host | `sandbox` CLI | `up` mints the password (`sandboxes/<name>/webui-password`, mode 600 — kept beside the control dir, not inside it, so it is not in the gateway's bind mount; §10.1) and launches the UI on an **auto-assigned free port** (first free from 9999, skipping ports other sandboxes claim; stable across restarts via `webui-port`); `ls` prints each sandbox's URL + password + status; `down` stops it; `web [--stop]` (re)starts after a host reboot. `--web-port N` overrides. |
 
 ### 15.3 Security properties
 
@@ -875,7 +932,8 @@ own deadline has no deadline. Sandboxes with no recorded TTL are never touched u
 `reap --all` is used, so an interactive session is not swept away by the cron that exists
 to catch runaway batch runs.
 
-**Where the state lives.** `.devcontainer/.env` is last-writer-wins across parallel
-sandboxes (§11), so the durable copy of the limits, lane and lifetime is the per-sandbox
-control dir, exactly as harness/model selection already is. `ls` and `reap` both walk
-those dirs, which is why they can report on every sandbox at once and `.env` cannot.
+**Where the state lives.** The durable copy of the limits, lane and lifetime is the
+sandbox's own state dir (`sandboxes/<name>/`, §10.1), exactly as harness/model selection
+is. `ls` and `reap` both walk those dirs, which is why they can report on every sandbox
+at once — a single shared env file could not, being last-writer-wins across parallel
+sandboxes (§11).
