@@ -150,7 +150,10 @@ Useful `up` flags:
 | `--harness H` | agent CLI: `claudecode` (default), `pi`, `omp`, `prime-agent` |
 | `--llm-backend B` | `anthropic` (default), `ollama`, `openai-compat` |
 | `--llm-url URL` | backend endpoint (required for `openai-compat`) |
-| `--model ID` / `--small-model ID` | model ids; for a local backend both are auto-picked (largest / smallest tool-capable) if omitted |
+| `--model ID` | model id; for a local backend the largest tool-capable one is auto-picked if omitted |
+| `--small-model ID` | model for the fast/subagent slot. Defaults to the **same** model on a local backend — a distinct one means two models resident, which thrashes on a single GPU (and under `OLLAMA_MAX_LOADED_MODELS=1`). Split them when the box has room. |
+| `--model-context N` | pin the usable context window instead of probing for it |
+| `--no-context-probe` | skip the check for a backend that silently truncates prompts (see below) |
 | `--flywheel` | record every LLM call for later distillation or eval — **unredacted**, see below |
 | `--port HOST:CTR` | publish an app port explicitly. **Omit it** and a free host port (from 3000) is auto-assigned → container `:3000`, so parallel sandboxes never collide. |
 | `--web-port N` | pin the host-only broker UI port (default: first free from 9999). |
@@ -191,10 +194,19 @@ no rebuild, no restart, credentials in the broker survive:
 ./sandbox open --name cc-repo --harness omp --model qwen3.5:35b             # switch, in place
 ```
 
-The CLI picks a default model for a local backend (largest tool-capable), reads each
-model's **real context window** from the backend so the harness does not assume its own
-default, and appends whatever domains the harness and backend need to the sandbox's
+The CLI picks a default model for a local backend (largest tool-capable), sizes the
+context window, and appends whatever domains the harness and backend need to the sandbox's
 egress allowlist.
+
+> **The context check earns its keep.** A model's advertised window (`/api/show` says
+> 262144 for qwen3.5:35b) is not what the server serves — Ollama serves its own `num_ctx`,
+> defaulting to a few thousand tokens, and silently truncates longer prompts **from the
+> front**, where every harness puts its system prompt and tool schemas. The model then gets
+> style rules and no tools, and narrates tool calls as prose or invented XML (`<exec>`,
+> `<evidence-and-output>`) that nothing executes — with no error anywhere, so it reads as
+> "this model can't use tools". `sandbox up` measures the served window and warns with the
+> fix (`OLLAMA_CONTEXT_LENGTH=32768`, or `PARAMETER num_ctx`), capping the sandbox's context
+> to what the server actually accepts. See plan §17.
 
 ## Web search
 

@@ -787,6 +787,38 @@ so one writer serves all three. Two details are load-bearing:
   (`contextWindow`, or `CLAUDE_CODE_MAX_CONTEXT_TOKENS`) — otherwise a 32k model is fed
   200k of context, or a 262k model is compacted at a quarter full.
 
+**Preamble size is a harness-selection criterion for local models.** Measured on the wire
+(same task, same backend): pi sends ~1,400 tokens before your first word (644 of system
+prompt, 4 tool schemas at ~755); omp sends ~14,837 (5,060 of system prompt, 11 tool schemas
+at ~9,777) — 10.6x. On a frontier API that is free; on a local model it is the difference
+between a 32k window being roomy and being nearly full on arrival. So the harness choice
+and the served context window are one decision, not two: pi is comfortable at 32k, omp
+wants 64k+. The fast/subagent slot therefore defaults to the *same* model on a local
+backend — a second resident model costs VRAM that the first model's KV cache needs, and
+under `OLLAMA_MAX_LOADED_MODELS=1` it thrashes (every subagent call evicts and reloads the
+main model). `--small-model` splits them when the box has room.
+
+**The served window is not the model's window.** `/api/show` reports what a model was
+*trained* for (262144 for qwen3.5:35b); the server serves whatever its own `num_ctx` says,
+and Ollama's default is a few thousand tokens. Exceed it and the prompt is silently
+truncated **from the front** — which is exactly where every harness puts its system prompt
+and tool schemas. The model then receives style instructions and no tools, and does the
+only thing left: it *narrates* tool calls as prose or invented XML (`<exec>`,
+`<evidence-and-output>`) that no harness parses. Nothing errors; the transcript merely
+looks like a model too weak to use tools. Measured on a server capped at 2048: a
+6,657-token payload and a 14,856-token payload both came back `prompt_eval_count=2050`,
+and the identical payload at `num_ctx=16384` evaluated 7,626 tokens and produced a correct
+tool call — same model, same request.
+
+So `sandbox up` measures the *served* window rather than trusting the advertised one:
+`probe_models.py --effective-context` sends a filler prompt of known size and compares it
+against the `usage.prompt_tokens` the backend reports back (an OpenAI-compat field, so this
+is not Ollama-specific). A shortfall is a hard failure signal — the CLI warns with the fix
+(`OLLAMA_CONTEXT_LENGTH` / `PARAMETER num_ctx`) and caps the sandbox's context to what the
+server will actually accept, so the harness does not plan for a window that is being thrown
+away. `--model-context N` pins the window by hand and disables the capping;
+`--no-context-probe` skips the check (it costs one prefill of ~6k tokens at `up`).
+
 A generated config carries a sidecar marker; a file we did not write is moved to
 `<file>.pre-sandbox` rather than clobbered, and providers you add by hand survive
 regeneration.

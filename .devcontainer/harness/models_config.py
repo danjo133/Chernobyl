@@ -48,6 +48,16 @@ def build_provider(args):
         if tokens.isdigit():
             windows[model_id] = int(tokens)
 
+    # ID=text,image pairs: what the model can be SENT. Without this the pi family assumes
+    # text-only and disables anything vision-dependent (omp's snapcompact summariser is
+    # the one that says so out loud) even against a multimodal model.
+    inputs = {}
+    for pair in args.input:
+        model_id, _, mods = pair.partition("=")
+        mods = [m for m in mods.split(",") if m]
+        if mods:
+            inputs[model_id] = mods
+
     seen, models = set(), []
     for m in args.model:
         if m in seen:
@@ -56,6 +66,8 @@ def build_provider(args):
         entry = {"id": m, "name": model_alias(m)}
         if m in windows:
             entry["contextWindow"] = windows[m]
+        if m in inputs:
+            entry["input"] = inputs[m]
         models.append(entry)
     provider = {"baseUrl": args.base_url, "api": args.api, "models": models}
     if args.api_key:
@@ -77,6 +89,9 @@ def yaml_dump(config):
             out.append(f"        name: {json.dumps(model['name'])}")
             if "contextWindow" in model:
                 out.append(f"        contextWindow: {model['contextWindow']}")
+            if "input" in model:
+                # JSON list == YAML flow sequence, so this needs no extra quoting rules.
+                out.append(f"        input: {json.dumps(model['input'])}")
     return "\n".join(out) + "\n"
 
 
@@ -117,6 +132,7 @@ def main():
     ap.add_argument("--api-key", default="")
     ap.add_argument("--model", action="append", default=[])
     ap.add_argument("--context", action="append", default=[], metavar="ID=TOKENS")
+    ap.add_argument("--input", action="append", default=[], metavar="ID=text,image")
     args = ap.parse_args()
 
     if not args.model:
