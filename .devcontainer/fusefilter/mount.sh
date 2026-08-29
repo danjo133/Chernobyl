@@ -21,7 +21,17 @@ ENV_FILE="${SANDBOX_ENV_FILE:-$DC_DIR/.env}"
 # Defaults: expose the repo that contains .devcontainer, mount under the user runtime dir.
 SANDBOX_SOURCE="${SANDBOX_SOURCE:-$(cd "$DC_DIR/.." && pwd)}"
 SANDBOX_NAME="${SANDBOX_NAME:-cc-sandbox}"
-SANDBOX_MOUNT="${SANDBOX_MOUNT:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/devfilter/$SANDBOX_NAME}"
+# The user runtime dir only exists for real login sessions — a user reached via
+# su/sudo, a service account or cron has no /run/user/<uid>, and /run/user is
+# root-owned so it cannot be created. Fall back to state, which is always writable.
+runtime_root() {
+  local d="${XDG_RUNTIME_DIR:-}"
+  [ -n "$d" ] && [ -d "$d" ] && [ -w "$d" ] && { echo "$d"; return; }
+  d="/run/user/$(id -u)"
+  [ -d "$d" ] && [ -w "$d" ] && { echo "$d"; return; }
+  echo "$STATE/run"
+}
+SANDBOX_MOUNT="${SANDBOX_MOUNT:-$(runtime_root)/devfilter/$SANDBOX_NAME}"
 
 # Prefer a binary shipped by `make install`, then one built earlier into state, then
 # build it. Building lands in $STATE/bin when $HERE is not writable (shared install).

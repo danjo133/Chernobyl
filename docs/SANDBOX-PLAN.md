@@ -325,6 +325,12 @@ designed in from the start:**
 - VS Code + Dev Containers extension (for the editor path).
 - Go (or Nix) **to build** the FUSE filter. A finished install ships the binary, so a
   machine that only *runs* sandboxes does not need Go.
+- Ideally a **real login session** for the user running `sandbox`. systemd-logind
+  creates `/run/user/<uid>` (tmpfs) only for login sessions; a user reached through
+  `su`/`sudo`, a service account, or cron has none, and `/run/user` is root-owned so it
+  cannot be created on demand. The CLI falls back to mounting under its state dir, which
+  works but is not tmpfs — a mount orphaned by a crash persists until `sandbox down`.
+  `sudo loginctl enable-linger <user>` gives a service account a persistent runtime dir.
 
 `./install.sh --check` reports on all of the above without changing anything, and
 splits them by consequence: a missing *required* tool means no sandbox can come up, a
@@ -400,6 +406,7 @@ $SANDBOX_STATE_DIR/                   default $XDG_STATE_HOME/agent-sandbox
 $SANDBOX_HOMES/                       default ~/.sandbox/homes — per-harness logins,
                                       bind-mounted into every sandbox (§17)
 $XDG_RUNTIME_DIR/devfilter/<name>/    the FUSE-filtered view (§3.3)
+  $SANDBOX_STATE_DIR/run/devfilter/<name>/   ...or here, with no login session (§9)
 ```
 
 Only `control/` crosses into a container, so host-side material — the broker UI

@@ -121,6 +121,19 @@ state_set() { mkdir -p "$(state_dir "$1")"; printf '%s\n' "$3" > "$(state_dir "$
 state_get() { local f; f="$(state_dir "$1")/$2"; [ -f "$f" ] && cat "$f" || true; }
 state_clear() { rm -f "$(state_dir "$1")/$2"; }
 
+# Where the FUSE view gets mounted. The user runtime dir is preferred (tmpfs, cleaned
+# up at logout), but it only exists for real login sessions: a user reached through
+# su/sudo, a service account, or a cron job has no /run/user/<uid>, and /run/user is
+# root-owned, so creating it is not an option. Fall back to state, which is always ours.
+runtime_root() {
+  local d="${XDG_RUNTIME_DIR:-}"
+  [ -n "$d" ] && [ -d "$d" ] && [ -w "$d" ] && { echo "$d"; return; }
+  d="/run/user/$(id -u)"
+  [ -d "$d" ] && [ -w "$d" ] && { echo "$d"; return; }
+  echo "$STATE/run"
+}
+mount_point() { echo "$(runtime_root)/devfilter/$1"; }
+
 # Point every later compose invocation at this sandbox's env file. Compose used to pick
 # up .devcontainer/.env implicitly (it sits beside compose.yaml); now that per-sandbox
 # state lives outside the install tree, the file has to be named explicitly — otherwise
@@ -415,7 +428,12 @@ setup_claude_home() {
       sed 's|\$HOME|/home/node|g' "$MINIONS_DIR/settings.template.json" > "$SANDBOX_CLAUDE_HOME/settings.json"
     fi
   else
-    echo "sandbox: WARNING — MINIONS_DIR ($MINIONS_DIR) not found; agents/skills/hooks won't load." >&2
+    # Optional: the sandbox is fully usable without it, you just get a stock agent.
+    # Worth being explicit, since the default is per-user and a shared install will
+    # hit this for every user who has no checkout at the default path.
+    echo "sandbox: note — no Minions toolkit at $MINIONS_DIR, so agents/skills/hooks won't load." >&2
+    echo "sandbox:        harmless if you don't use it; otherwise set MINIONS_DIR=/path/to/Minions" >&2
+    echo "sandbox:        (export it in your shell rc to make it stick)." >&2
   fi
 }
 
@@ -565,7 +583,17 @@ case "$cmd" in
     fi
 
     NAME="${NAME:-$(default_name "$SOURCE")}"
-    MOUNT="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/devfilter/$NAME"
+    MOUNT="$(mount_point "$NAME")"
+    # Say so when we are not on the runtime dir: the fallback lives on disk rather than
+    # tmpfs, so a mount left behind by a crash persists across restarts (clear with `down`).
+    case "$MOUNT" in
+      "$STATE"/run/*)
+        echo "sandbox: note — no usable /run/user/$(id -u) (no login session?), so the FUSE view" >&2
+        echo "sandbox:        mounts under $STATE/run instead. Works, but it is not tmpfs:" >&2
+        echo "sandbox:        use 'sandbox down' to clean up; it will not clear itself." >&2
+        echo "sandbox:        For a service account, 'sudo loginctl enable-linger $(id -un)' gives" >&2
+        echo "sandbox:        it a persistent /run/user/<uid> and this note goes away." >&2;;
+    esac
 
     setup_claude_home
 
@@ -614,6 +642,7 @@ EOF
     compose_bind "$NAME"
 
     # Remember the selection for this sandbox: `open` reuses it, `ls` displays it.
+    state_set "$NAME" mount "$MOUNT"          # so `down` unmounts exactly what `up` mounted
     state_set "$NAME" harness "$HARNESS"
     state_set "$NAME" llm-backend "$BACKEND"
     state_set "$NAME" llm-url "$LLM_URL"
@@ -885,7 +914,7 @@ EOF
     # Include the tools overlay if this sandbox used it, so the sidecar is torn down too.
     [ -d "$(tools_ssh_dir "$NAME")" ] && COMPOSE+=(-f "$DC/compose.tools.yaml")
     COMPOSE_PROJECT_NAME="$NAME" "${COMPOSE[@]}" down
-    "$DC/fusefilter/unmount.sh" "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/devfilter/$NAME" || true
+    "$DC/fusefilter/unmount.sh" "$(state_get "$NAME" mount || true)" || true
     ;;
 
   tools)
