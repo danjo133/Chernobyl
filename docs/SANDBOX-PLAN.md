@@ -134,6 +134,23 @@ Status: **design approved, not yet built.** Target host is NixOS, runtime Docker
   user FUSE mount needs `user_allow_other` (`programs.fuse.userAllowOther = true;`
   on NixOS) + `-o allow_other`. **Rootless Docker / Podman avoids this** — the
   daemon runs as you, so the bind "just works." Hence the rootless recommendation.
+- **Owner rewriting (`-uid` / `-gid`):** the workload runs as uid 1000 (`node`), and
+  the filter used to report each file's real owner. On a host where the invoking user is
+  **not** uid 1000, every file in `/workspace` then looked alien and the agent could not
+  write it — git, node and editors all `stat()` before they write. `gitignore-fuse -uid N
+  -gid N` makes the view *report* that owner for every file; `mount.sh` passes
+  `SANDBOX_FS_UID`/`SANDBOX_FS_GID` (default `1000`, so hosts where the user IS uid 1000
+  see no change), and `sandbox up --fs-uid N --fs-gid N` persists them into the
+  per-sandbox env file. Set both to `0` to report the true owner.
+  Only the *view* lies: the daemon keeps doing the real syscalls as the invoking host
+  user, so files land on disk owned by them and stay usable outside the sandbox. This
+  works because the mount does **not** use `default_permissions`, so the kernel delegates
+  every access check to the daemon rather than testing uid 1000 against the reported
+  owner. An idmapped bind mount under the filter is NOT an alternative: the daemon's own
+  uid is unmapped there, so every write fails with `EOVERFLOW`.
+  Note `fs.Options.UID`/`GID` in go-fuse cannot do this — go-fuse applies them only when
+  the underlying uid is `0` — so the override is applied per node, in each attr-returning
+  op (`Lookup`, `Getattr`, `Setattr`, `Create`, `Mkdir`, `Mknod`, `Symlink`, `Link`).
 
 ### 3.4 Wiring — VS Code + headless CLI
 

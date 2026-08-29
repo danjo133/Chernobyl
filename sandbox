@@ -20,6 +20,8 @@
 #                [--allow-image-build]     seccomp=unconfined, so rootless podman/buildah can build images
 #                [--cpus N]                CPU limit for the workload (default 4; env SANDBOX_CPUS)
 #                [--memory SIZE]           memory limit for the workload (default 8g; env SANDBOX_MEMORY)
+#                [--fs-uid N] [--fs-gid N]  owner the FUSE view reports for every file
+#                                          (default 1000 = the container's `node` user; 0 = the real owner)
 #                [--policy FILE:LANE]      apply one lane of a policy file: egress allowlist,
 #                                          harness, backend, cpu/memory, TTL. Flags win over it.
 #                [--ttl MINUTES]           wall-clock lifetime (0 = none); `sandbox reap` enforces it.
@@ -75,6 +77,10 @@ WEB_PORT_DEFAULT=9999
 # Workload resource ceiling. A lane policy or --cpus/--memory overrides it per sandbox.
 SANDBOX_CPUS_DEFAULT="${SANDBOX_CPUS:-4}"
 SANDBOX_MEMORY_DEFAULT="${SANDBOX_MEMORY:-8g}"
+# Owner the FUSE view reports. 1000 is the workload's `node` user; a host user whose uid
+# is not 1000 needs this or the container cannot write the repo. See §3.3.
+SANDBOX_FS_UID_DEFAULT="${SANDBOX_FS_UID:-1000}"
+SANDBOX_FS_GID_DEFAULT="${SANDBOX_FS_GID:-1000}"
 # `sandbox reap --all` also reaps sandboxes that never declared a TTL — after this long.
 REAP_DEFAULT_MINUTES="${SANDBOX_REAP_DEFAULT_MINUTES:-1440}"
 
@@ -465,6 +471,7 @@ case "$cmd" in
     SEARCH_URL="${SANDBOX_SEARCH_URL:-}"
     # Empty = "not given on the command line", so a --policy can fill it in below.
     POLICY=""; LANE=""; CPUS=""; MEMORY=""; TTL=""; RUN_ID=""
+    FS_UID=""; FS_GID=""
     HARNESS_SET=0; BACKEND_SET=0
     while [ $# -gt 0 ]; do case "$1" in
       --source) SOURCE="$2"; shift 2;;
@@ -493,6 +500,8 @@ case "$cmd" in
       --allow-image-build|--disable-seccomp) ALLOW_IMAGE_BUILD=1; shift;;
       --cpus) CPUS="$2"; shift 2;;
       --memory) MEMORY="$2"; shift 2;;
+      --fs-uid) FS_UID="$2"; shift 2;;    # owner the FUSE view reports (0 = the real owner)
+      --fs-gid) FS_GID="$2"; shift 2;;
       --policy) POLICY="$2"; shift 2;;
       --ttl) TTL="$2"; shift 2;;          # wall-clock minutes; `sandbox reap` enforces it
       --run-id) RUN_ID="$2"; shift 2;;    # caller's id for this run (set by `spawn`)
@@ -522,6 +531,16 @@ case "$cmd" in
     case "$CPUS" in ''|*[!0-9.]*) die "--cpus wants a number of cores (got '$CPUS')";; esac
     case "$MEMORY" in ''|*[!0-9bkmgBKMG]*) die "--memory wants a size like 8g or 512m (got '$MEMORY')";; esac
     case "$TTL" in ''|0) TTL="";; *[!0-9]*) die "--ttl wants whole minutes (got '$TTL')";; esac
+
+    # The uid/gid the filtered view reports. Both must be set or neither, so the view
+    # never reports a half-override; gitignore-fuse rejects that combination too.
+    FS_UID="${FS_UID:-$SANDBOX_FS_UID_DEFAULT}"
+    FS_GID="${FS_GID:-$SANDBOX_FS_GID_DEFAULT}"
+    case "$FS_UID" in ''|*[!0-9]*) die "--fs-uid wants a uid (got '$FS_UID')";; esac
+    case "$FS_GID" in ''|*[!0-9]*) die "--fs-gid wants a gid (got '$FS_GID')";; esac
+    if { [ "$FS_UID" = 0 ] && [ "$FS_GID" != 0 ]; } || { [ "$FS_UID" != 0 ] && [ "$FS_GID" = 0 ]; }; then
+      die "--fs-uid and --fs-gid must both be 0 (report the real owner) or both non-zero"
+    fi
 
     # Resolve harness + backend up front: both contribute egress allowlist entries, and
     # a typo here should fail before anything is built.
@@ -601,6 +620,8 @@ ALLOWLIST_FILE=$ALLOWLIST_FILE
 FLYWHEEL=$FLYWHEEL
 SANDBOX_CPUS=$CPUS
 SANDBOX_MEMORY=$MEMORY
+SANDBOX_FS_UID=$FS_UID
+SANDBOX_FS_GID=$FS_GID
 SANDBOX_POLICY=$POLICY
 SANDBOX_LANE=$LANE
 SANDBOX_STARTED_AT=$STARTED_AT

@@ -23,6 +23,14 @@ SANDBOX_SOURCE="${SANDBOX_SOURCE:-$(cd "$DC_DIR/.." && pwd)}"
 SANDBOX_NAME="${SANDBOX_NAME:-cc-sandbox}"
 SANDBOX_MOUNT="${SANDBOX_MOUNT:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/devfilter/$SANDBOX_NAME}"
 
+# Owner the filtered view REPORTS for every file. The workload runs as uid 1000 (`node`),
+# so default to that: on a host where the invoking user is already uid 1000 this changes
+# nothing, and where it is not, the container stops seeing an alien owner it may not write.
+# The daemon still does the real I/O as the invoking user, so files on disk stay theirs.
+# Set both to 0 to report the true owner instead. See docs/SANDBOX-PLAN.md §3.3.
+SANDBOX_FS_UID="${SANDBOX_FS_UID:-1000}"
+SANDBOX_FS_GID="${SANDBOX_FS_GID:-1000}"
+
 # Prefer a binary shipped by `make install`, then one built earlier into state, then
 # build it. Building lands in $STATE/bin when $HERE is not writable (shared install).
 BIN=""
@@ -62,7 +70,8 @@ else
   ALLOW_OTHER_FLAG=""
   [ "$DOCKER_ROOTFUL" = "1" ] && ALLOW_OTHER_FLAG="-allow-other"
   echo "mount.sh: mounting $SANDBOX_SOURCE -> $SANDBOX_MOUNT"
-  "$BIN" -source "$SANDBOX_SOURCE" -mount "$SANDBOX_MOUNT" ${ALLOW_OTHER_FLAG} &
+  "$BIN" -source "$SANDBOX_SOURCE" -mount "$SANDBOX_MOUNT" \
+    -uid "$SANDBOX_FS_UID" -gid "$SANDBOX_FS_GID" ${ALLOW_OTHER_FLAG} &
   # wait for the mount to come live
   for _ in $(seq 1 50); do mountpoint -q "$SANDBOX_MOUNT" && break; sleep 0.1; done
   mountpoint -q "$SANDBOX_MOUNT" || { echo "mount.sh: mount failed" >&2; exit 1; }
