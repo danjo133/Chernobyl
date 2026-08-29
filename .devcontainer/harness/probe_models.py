@@ -11,6 +11,8 @@ back to the OpenAI-compatible /v1/models.
   probe_models.py URL --pick-small   smallest tool-capable model (for the fast/subagent slot)
   probe_models.py URL --context ID   that model's advertised context window, in tokens
   probe_models.py URL --input ID     its input modalities ("text" / "text,image")
+  probe_models.py URL --served-context ID   the window the server is ENFORCING for a
+                                 model it already has loaded (Ollama /api/ps)
   probe_models.py URL --effective-context ID [--probe-tokens N]
                                  what the SERVER actually accepts (see below)
 
@@ -201,8 +203,8 @@ def context_window(base, model_id):
 def main():
     if len(sys.argv) < 2:
         sys.exit(
-            "usage: probe_models.py URL "
-            "[--pick|--pick-small|--context ID|--effective-context ID [--probe-tokens N]]"
+            "usage: probe_models.py URL [--pick|--pick-small|--context ID|--input ID"
+            "|--served-context ID|--effective-context ID [--probe-tokens N]]"
         )
     url, mode = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else "")
 

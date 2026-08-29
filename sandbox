@@ -187,7 +187,12 @@ migrate_legacy_state() {
     [ -f "$DC/.allowlist-$n.txt" ] && mv "$DC/.allowlist-$n.txt" "$(allowlist_file "$n")"
     [ -d "$DC/.tools-$n" ] && mv "$DC/.tools-$n" "$(tools_ssh_dir "$n")"
     # Scratch scalars lived in the control dir; lift them out of the container mount.
-    for k in harness llm-backend llm-url model small-model model-context \
+    # `flywheel` matters beyond tidiness: the control dir is the gateway's
+    # /run/broker-control, and the flywheel addon needs a DIRECTORY at <ctrl>/flywheel for
+    # its captures. Pre-install versions stored the on/off flag in a FILE of that exact
+    # name, so leaving it behind makes the addon's makedirs() fail and capture silently
+    # disable. The `-f` guard means an existing capture DIRECTORY is never moved.
+    for k in harness llm-backend llm-url model small-model model-context flywheel \
              webui-port app-port caido-port webui-password webui.pid webui.log \
              lane started-at ttl-minutes run-id; do
       [ -f "$new/$k" ] && mv "$new/$k" "$(state_dir "$n")/$k"
@@ -770,17 +775,6 @@ EOF
     # Before any COMPOSE+=(-f ...) below — compose_bind reassigns the array.
     compose_bind "$NAME"
 
-    # TODO: Fix this to work with control dir as set from above
-    # harness_home_env_lines >> "$DC/.env"   # SANDBOX_CLAUDE_HOME / _PI_ / _OMP_ / _PRIME_HOME
-    # mkdir -p "$DC/.broker-control-$NAME"
-    # Migration: this state dir is ALSO the gateway's /run/broker-control, and the flywheel
-    # addon needs a DIRECTORY at <ctrl>/flywheel for its captures. Older versions stored the
-    # on/off flag in a FILE of that exact name, which made the addon's makedirs() fail and
-    # (because mitmdump aborts on any error logged at startup) took the whole gateway down.
-    # The flag now lives in `flywheel-enabled`; drop the stale file so the dir can be created.
-    # [ -e "$DC/.broker-control-$NAME/flywheel" ] && [ ! -d "$DC/.broker-control-$NAME/flywheel" ] \
-    #  && rm -f "$DC/.broker-control-$NAME/flywheel"
-
     # Remember the selection for this sandbox: `open` reuses it, `ls` displays it.
     state_set "$NAME" mount "$MOUNT"          # so `down` unmounts exactly what `up` mounted
     state_set "$NAME" harness "$HARNESS"
@@ -806,8 +800,6 @@ EOF
     state_set "$NAME" run-id "$RUN_ID"
     # `open` needs this to know whether a non-:443 backend is actually reachable.
     state_set "$NAME" allow-internet "$ALLOW_INTERNET"
-    # NOT `flywheel` — that name is the addon's capture DIRECTORY in this same dir (see above).
-    state_set "$NAME" flywheel-enabled "$FLYWHEEL"
 
     # App port forward: an explicit --port HOST:CTR is honoured verbatim; otherwise
     # auto-assign a free host port (3000+, stable per sandbox) -> container :3000,
@@ -993,7 +985,7 @@ EOF
         printf "  %-22s agent -> %s via %s%s%s\n" "" \
           "$(cat "$ctrl/harness")" "$(cat "$ctrl/llm-backend" 2>/dev/null || echo anthropic)" \
           "$( [ -s "$ctrl/model" ] && printf ' (%s)' "$(cat "$ctrl/model")" )" \
-          "$( [ "$(cat "$ctrl/flywheel-enabled" 2>/dev/null)" = 1 ] && printf '  [flywheel]' )"
+          "$( [ "$(cat "$ctrl/flywheel" 2>/dev/null)" = 1 ] && printf '  [flywheel]' )"
         [ -s "$ctrl/search-url" ] && printf "  %-22s search -> %s\n" "" "$(cat "$ctrl/search-url")"
       fi
       # Lane policy + how much of its wall-clock lifetime this sandbox has used.
@@ -1180,6 +1172,19 @@ EOF
       if [ -n "$SMALL_MODEL" ]; then
         probed="$(python3 "$HARNESS_LIB_DIR/probe_models.py" "$B_URL" --context "$SMALL_MODEL" 2>/dev/null || true)"
         if [ -n "$probed" ]; then SMALL_MODEL_CONTEXT="$probed"; fi
+      fi
+      # --context reports the TRAINED maximum, which is exactly the number `up` capped
+      # after measuring what the server actually serves. Re-probing it here would hand
+      # that discarded number straight back to the harness, so re-apply the cap. /api/ps
+      # is instant and needs no prefill, unlike `up`'s one-off --effective-context probe.
+      SERVED="$(python3 "$HARNESS_LIB_DIR/probe_models.py" "$B_URL" --served-context "$MODEL" 2>/dev/null || true)"
+      if [ -n "$SERVED" ] && [ -n "$MODEL_CONTEXT" ] && [ "$SERVED" -lt "$MODEL_CONTEXT" ] 2>/dev/null; then
+        echo "sandbox: '$B_URL' serves only $SERVED of '$MODEL' trained $MODEL_CONTEXT tokens — capping to $SERVED." >&2
+        echo "sandbox:   (raise OLLAMA_CONTEXT_LENGTH, or pin with --model-context, to use more.)" >&2
+        MODEL_CONTEXT="$SERVED"
+        if [ -n "$SMALL_MODEL_CONTEXT" ] && [ "$SMALL_MODEL_CONTEXT" -gt "$SERVED" ] 2>/dev/null; then
+          SMALL_MODEL_CONTEXT="$SERVED"
+        fi
       fi
     fi
     state_set "$NAME" model-context "$MODEL_CONTEXT"
