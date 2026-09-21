@@ -2,9 +2,15 @@
 # UNVERIFIED scaffold.
 FROM debian:bookworm-slim
 
+# nftables + dnsmasq are for GATEWAY_MODE=router, where the workload is a
+# separate machine on a private link: nft programs prerouting/forward, dnsmasq
+# hands the workload its address and resolves for it. Neither is used in the
+# default netns mode, and neither runs unless that mode is selected.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       iptables \
+      nftables \
+      dnsmasq \
       redis-server \
       ca-certificates \
       openssl \
@@ -29,7 +35,17 @@ RUN useradd --create-home --shell /usr/sbin/nologin --uid 4242 mitm \
  && chown mitm:mitm /var/lib/broker /run/broker
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+COPY firewall-netns.sh /usr/local/bin/firewall-netns.sh
+COPY firewall-router.sh /usr/local/bin/firewall-router.sh
+COPY dnsmasq-router.sh /usr/local/bin/dnsmasq-router.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh \
+             /usr/local/bin/firewall-netns.sh \
+             /usr/local/bin/firewall-router.sh \
+             /usr/local/bin/dnsmasq-router.sh
+
+# dnsmasq's package starts it as a service; router mode runs it itself from the
+# entrypoint, so keep the packaged unit out of the way.
+RUN rm -f /etc/dnsmasq.d/README 2>/dev/null || true
 
 # broker_addon.py / allowed-domains.txt / scopes.yaml are bind-mounted by compose
 # (so you can edit + hot-reload without rebuilding).

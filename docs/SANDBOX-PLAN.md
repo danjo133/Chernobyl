@@ -79,11 +79,41 @@ Status: **design approved, not yet built.** Target host is NixOS, runtime Docker
 
 | File | Purpose |
 |---|---|
-| `Dockerfile` | mitmproxy + iptables + redis client + entrypoint |
-| `entrypoint.sh` | enable `ip_forward`, install REDIRECT+NAT rules, start redis (or attach to redis svc), exec mitmproxy |
+| `Dockerfile` | mitmproxy + iptables/nftables + dnsmasq + redis client + entrypoint |
+| `entrypoint.sh` | pick the attach mode, start redis (or attach to redis svc), exec mitmproxy |
+| `firewall-netns.sh` | `GATEWAY_MODE=netns` (default): OUTPUT rules, proxy exempted by uid |
+| `firewall-router.sh` | `GATEWAY_MODE=router`: prerouting/forward rules, proxy exempted by interface |
+| `dnsmasq-router.sh` | router mode only: address + resolve for the workload on the private link |
 | `broker_addon.py` | mitmproxy addon: allowlist + scope-checked credential injection / phantom-token swap + confused-deputy guards + redaction |
 | `allowed-domains.txt` | editable egress allowlist |
 | `scopes.yaml` | per-handle / per-host scope rules (host, path, method, TTL) |
+
+#### Two attach modes
+
+How the workload is attached decides where the filter lives. The addons, the
+allowlist, the broker and the flywheel are identical in both — only the packet
+plumbing forks.
+
+| | `netns` (default) | `router` |
+|---|---|---|
+| Attachment | `network_mode: service:gateway` — one namespace | separate machine on a private link |
+| Filter hook | `output` | `prerouting` + `forward` |
+| Proxy told apart by | uid (`-m owner --uid-owner`) | interface (`iifname`) |
+| Workload address | Docker's | DHCP from dnsmasq on the gateway |
+| DNS | Docker's embedded resolver at `127.0.0.11` | dnsmasq, one configured upstream |
+
+Router mode exists for Incus instances (Omni D20) and any other two-host
+setup. It is the **stronger** of the two: netns mode's uid split is fragile
+because a uid collision makes the workload match the proxy's `RETURN`
+exemption and bypass the firewall entirely — the reason `mitm` is pinned to
+4242. Interfaces cannot collide that way. Router mode also installs no
+masquerade rule, so the workload's packets have no path outward except
+terminating at mitmproxy.
+
+Router mode was verified end to end on 2026-09-21: an allowlisted host returns
+200 through the proxy, a non-allowlisted host is refused, the same request
+without the gateway CA fails (so TLS really is terminated there), and port 80,
+port 8080, port 22, ICMP, IPv6 and a raw DNS tunnel are all blocked.
 
 - **Transparent MITM:** `iptables -t nat … -j REDIRECT` sends all forwarded
   80/443 to mitmproxy (excluding mitmproxy's own uid to avoid loops). Because it's
