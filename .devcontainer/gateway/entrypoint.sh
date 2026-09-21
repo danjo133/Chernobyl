@@ -46,13 +46,20 @@ chown -R "$PROXY_USER:$PROXY_USER" "$CONFDIR"
 GATEWAY_MODE="${GATEWAY_MODE:-netns}"
 export PROXY_UID MITM_PORT
 
+# The helper scripts always ship beside this one, so find them relative to it
+# rather than at a fixed path. In the Docker image that is /usr/local/bin; when
+# the same directory is mounted into an instance (Omni mounts it at
+# /opt/broker) it is wherever it landed. A hardcoded path works in the first
+# case and fails with "No such file or directory" in the second.
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
 case "$GATEWAY_MODE" in
   netns)
-    /usr/local/bin/firewall-netns.sh
+    "$HERE/firewall-netns.sh"
     ;;
   router)
-    /usr/local/bin/firewall-router.sh
-    /usr/local/bin/dnsmasq-router.sh
+    "$HERE/firewall-router.sh"
+    "$HERE/dnsmasq-router.sh"
     ;;
   *)
     echo "gateway: FATAL — GATEWAY_MODE='$GATEWAY_MODE' is not netns or router." >&2
