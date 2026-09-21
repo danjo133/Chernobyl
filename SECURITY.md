@@ -22,9 +22,11 @@ and multi-tenant hosts (see "single-user host" below).
 
 ## Guarantees the architecture provides
 
-1. **Egress is deny-by-default and allowlisted.** The workload shares the gateway's network
-   namespace and holds **no** `NET_ADMIN`/`NET_RAW` (`cap_drop: ALL`), so it cannot alter the
-   firewall. All TCP egress is force-redirected through mitmproxy, which enforces a domain
+1. **Egress is deny-by-default and allowlisted.** The workload cannot alter the firewall,
+   because the firewall is not in its reach. In the default `netns` mode it shares the
+   gateway's network namespace and holds **no** `NET_ADMIN`/`NET_RAW` (`cap_drop: ALL`); in
+   `router` mode it is a separate machine whose only route out is the gateway, and it holds
+   no capabilities there at all. All TCP egress is force-redirected through mitmproxy, which enforces a domain
    allowlist (`gateway/allowed-domains.txt`); everything else is dropped. IPv6 egress is
    dropped entirely (fail-closed at startup).
 2. **Real credentials never enter the workload.** The broker injects secrets onto requests
