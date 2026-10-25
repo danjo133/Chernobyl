@@ -3,12 +3,12 @@
 #
 # SECURITY: use the official Docker image only. The pip wheels litellm==1.82.7 and
 # ==1.82.8 (Mar 2026) were a supply-chain compromise; the Docker path was NOT
-# affected. Pin to a specific >= 1.83.0 tag below and verify it against the
-# releases page (https://github.com/BerriAI/litellm/releases) — don't float `latest`.
+# affected. v1.107.0 (Oct 21 2026) was compromised on PyPI AND Docker (tags latest,
+# main-latest, main-stable included). Pinned to v1.106.2 by digest; never float tags
+# and don't move past it without checking https://docs.litellm.ai/blog/security-incident-oct-21-2026
 services:
   litellm:
-    # TODO: pin to a verified release, e.g. ghcr.io/berriai/litellm:v1.83.x-stable
-    image: ghcr.io/berriai/litellm:main-stable
+    image: ghcr.io/berriai/litellm:v1.106.2@sha256:7294b90f868c5c38c99b83021c7ba46f9b439e95f8e32964c925c7d2563a03f7
     command: ["--config", "/app/config.yaml", "--port", "4000"]
     ports:
       - "127.0.0.1:4000:4000"          # host-local only; never expose publicly
