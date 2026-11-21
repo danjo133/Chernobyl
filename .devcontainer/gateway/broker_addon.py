@@ -23,6 +23,8 @@ redis schema (populated out-of-band by the host-side filler — see broker/READM
   broker:handle:<handle>   -> JSON {"host","path_prefix","methods":[..],"headers":{..}}
                               (set with a redis TTL = the handle's expiry)
   broker:host:<host>       -> redis HASH of header-name -> header-value
+  broker:guard:github      -> JSON {"push_prefix": "omni/"}: turns on the GitHub write
+                              guard for this sandbox (absent = off; see github_guard_reason)
 """
 
 import json
@@ -52,6 +54,86 @@ HANDLE_HEADER = "x-sandbox-handle"
 
 log = logging.getLogger("broker")
 logging.basicConfig(level=logging.INFO)
+
+
+# ---- GitHub write guard ---------------------------------------------------------------
+# A sandboxed lane may push its own branch and open a PR; it may never merge, move the
+# default branch, or plant persistence. Without paid branch protection this gateway is
+# where that is enforced: the workload never holds the token, and these requests are
+# refused before any credential is attached. Turned on per sandbox by the host-side
+# filler (`fill.py guard`), so interactive sandboxes are unaffected.
+
+_GH_API, _GH_GIT = "api.github.com", "github.com"
+_GRAPHQL_DENY = ("mergePullRequest", "enablePullRequestAutoMerge", "updateRef", "updateRefs",
+                 "deleteRef", "createCommitOnBranch", "revertPullRequest", "mergeBranch",
+                 "updatePullRequestBranch", "createRef")
+
+
+def pkt_line_refs(body: bytes) -> list:
+    """Ref names from a git-receive-pack request's command list (pkt-lines up to the flush)."""
+    refs, i = [], 0
+    while i + 4 <= len(body):
+        try:
+            n = int(body[i:i + 4], 16)
+        except ValueError:
+            return refs + ["<unparseable>"]
+        if n == 0:
+            break                                   # flush: the pack data follows
+        if n < 4 or i + n > len(body):
+            return refs + ["<unparseable>"]
+        line = body[i + 4:i + n].split(b"\0", 1)[0].strip()
+        parts = line.split(b" ")
+        refs.append(parts[2].decode(errors="replace") if len(parts) >= 3 else "<unparseable>")
+        i += n
+    return refs
+
+
+def github_guard_reason(host, method, path, body, push_prefix):
+    """Why this request must be refused, or None. `push_prefix` like 'omni/'."""
+    host, method = (host or "").lower(), (method or "").upper()
+    path = (path or "").split("?", 1)[0]
+    seg = [p for p in path.split("/") if p]
+    if host == _GH_GIT:
+        if method == "POST" and path.endswith("/git-receive-pack"):
+            bad = [r for r in pkt_line_refs(body or b"") if not r.startswith("refs/heads/" + push_prefix)]
+            if bad:
+                return "push to " + ", ".join(bad[:3]) + f" (only refs/heads/{push_prefix}*)"
+        return None
+    if host != _GH_API:
+        return None
+    if method == "POST" and seg == ["graphql"]:
+        text = (body or b"").decode(errors="replace")
+        hit = [m for m in _GRAPHQL_DENY if m in text]
+        return f"GraphQL mutation {hit[0]}" if hit else None
+    if len(seg) < 3 or seg[0] != "repos":
+        return None
+    rest = seg[3:]                                  # after repos/{owner}/{repo}
+    if method == "PUT" and len(rest) == 3 and rest[0] == "pulls" and rest[2] == "merge":
+        return "merging a pull request"
+    if method == "POST" and rest == ["merges"]:
+        return "merging a branch"
+    if rest[:2] == ["git", "refs"] and method in ("POST", "PATCH", "DELETE"):
+        ref = "/".join(rest[2:])                    # heads/<name> for PATCH/DELETE; body for POST
+        if method == "POST":
+            try:
+                ref = json.loads(body or b"{}").get("ref", "")
+            except ValueError:
+                return "ref change with unreadable body"
+            ref = ref[len("refs/"):] if ref.startswith("refs/") else ref
+        if not ref.startswith("heads/" + push_prefix):
+            return f"moving ref {ref or '?'}"
+        return None
+    if rest[:1] == ["contents"] and method in ("PUT", "DELETE"):
+        try:
+            branch = (json.loads(body or b"{}") or {}).get("branch") or ""
+        except ValueError:
+            branch = ""
+        if not branch.startswith(push_prefix):
+            return f"committing to {branch or 'the default branch'} via the contents API"
+        return None
+    if method in ("POST", "PATCH", "PUT", "DELETE") and rest[:1] in (["hooks"], ["keys"]):
+        return "webhook or deploy-key change"
+    return None
 
 
 class RequestLog:
@@ -237,6 +319,8 @@ class Broker:
         spliced/pinned hosts are ignored at TLS and never reach an HTTP hook. Requires
         `connection_strategy=lazy` so the upstream connection is still unopened here.
         """
+        if flow.response is None and self._github_guard(flow):
+            return
         if self.caido is None or flow.response is not None:
             return
         via = ServerSpec(("http", self.caido))
@@ -247,6 +331,35 @@ class Broker:
         if flow.server_conn.timestamp_start is not None:
             flow.server_conn = Server(address=flow.server_conn.address)
         flow.server_conn.via = via
+
+    def _guard_prefix(self):
+        """The guard's allowed branch prefix for this sandbox, or None (guard off)."""
+        if self.r is None:
+            return None
+        try:
+            raw = self.r.get("broker:guard:github")
+        except Exception as e:  # noqa: BLE001
+            log.warning("broker: redis error on guard lookup: %s", e)
+            return None
+        if not raw:
+            return None
+        try:
+            return (json.loads(raw) or {}).get("push_prefix") or None
+        except ValueError:
+            return "\0"                             # unreadable config: allow nothing
+
+    def _github_guard(self, flow):
+        prefix = self._guard_prefix()
+        if prefix is None:
+            return False
+        req = flow.request
+        reason = github_guard_reason(req.pretty_host, req.method, req.path, req.get_content(strict=False), prefix)
+        if not reason:
+            return False
+        log.warning("DENY guard %s %s%s: %s", req.method, req.pretty_host, req.path.split("?", 1)[0], reason)
+        self.rlog.record("DENY_GUARD", req.method, req.pretty_host, req.path, reason=reason)
+        flow.response = http.Response.make(403, f"sandbox broker: {reason} is not allowed from a sandbox\n".encode())
+        return True
 
     def _inject(self, flow: http.HTTPFlow):
         host = flow.request.pretty_host

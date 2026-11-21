@@ -19,6 +19,10 @@ Examples
 
   # Inject-by-host static token for the GitHub API:
   ./fill.py host --host api.github.com --header "Authorization=token $GH_TOKEN"
+
+  # Turn on the GitHub write guard for this sandbox: push and open PRs on omni/*
+  # branches only; no merging, no default-branch commits, no hooks or deploy keys.
+  ./fill.py guard --github-push-prefix omni/
 """
 import argparse
 import json
@@ -51,6 +55,9 @@ def main():
     ho.add_argument("--host", required=True)
     ho.add_argument("--header", action="append", default=[], required=True)
 
+    g = sub.add_parser("guard", help="turn on the GitHub write guard (broker_addon.github_guard_reason)")
+    g.add_argument("--github-push-prefix", required=True, help="branches a sandbox may push, e.g. omni/")
+
     args = ap.parse_args()
 
     if args.cmd == "handle":
@@ -71,6 +78,13 @@ def main():
         key = f"broker:host:{args.host.lower()}"
         parts = " ".join(f"{json.dumps(k)} {json.dumps(v)}" for k, v in hdrs.items())
         print(f"HSET {key} {parts}")
+
+
+    elif args.cmd == "guard":
+        if not args.github_push_prefix or args.github_push_prefix in ("/", "*"):
+            sys.exit("refusing a guard prefix that allows every branch")
+        cfgj = json.dumps({"push_prefix": args.github_push_prefix})
+        print(f"SET broker:guard:github {json.dumps(cfgj)}")
 
 
 if __name__ == "__main__":
