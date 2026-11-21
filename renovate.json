@@ -11,7 +11,7 @@
     {
       "description": "Digest and patch bumps merge themselves once CI is green. Everything else waits for a person.",
       "matchUpdateTypes": ["digest", "pin", "pinDigest", "patch"],
-      "automerge": true
+      "automerge": false
     },
     {
       "description": "Never automerge: supply-chain history, data stores, SSO, object storage.",
